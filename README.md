@@ -48,7 +48,8 @@ The extension registers the `lmstudio` provider and discovers chat models from L
 Commands:
 
 - `/sync-models` — refresh model list from LM Studio
-- `/lmstudio-info` — show the current model's effective settings
+- `/model-info` — toggle the current model's brief settings widget
+- `/model-info-full` — show the current model's full settings in a scrollable overlay
 - `/lmstudio-profiles` — edit LM Studio model profiles
 - `/lmstudio-reload` — reload Pi to apply profile changes
 
