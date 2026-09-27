@@ -9,6 +9,10 @@ import { readFile, writeFile } from "node:fs/promises";
 
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const PROFILES_PATH = join(CONFIG_DIR, "lmstudio-profiles.json");
+const ENDPOINTS_PATH = join(CONFIG_DIR, "lmstudio-endpoints.json");
+const DEFAULT_LOCAL_ENDPOINT_ID = "local";
+const DEFAULT_LOCAL_PORT = "1234";
+const ENDPOINT_TIMEOUT_MS = 5_000;
 
 // Models whose names suggest they're embeddings, not chat models
 const EMBEDDING_PATTERNS = [
@@ -22,6 +26,14 @@ const EMBEDDING_PATTERNS = [
 ];
 
 // ── Profile types ───────────────────────────────────────────────────────────
+
+interface LmStudioEndpoint {
+  name?: string;
+  baseUrl: string;
+}
+
+type EndpointConfig = Record<string, LmStudioEndpoint>;
+type EndpointProfiles = Record<string, Record<string, ModelProfile>>;
 
 interface ModelProfile {
   name?: string;
@@ -156,14 +168,71 @@ function formatName(id: string): string {
 
 // ── Profile loading ─────────────────────────────────────────────────────────
 
-async function loadProfiles(): Promise<Record<string, ModelProfile>> {
+function normalizeProfiles(parsed: unknown): EndpointProfiles {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const object = parsed as Record<string, unknown>;
+
+  // Backward compatibility: the original format was model -> profile and
+  // implicitly referred to the local endpoint.
+  const values = Object.values(object);
+  const isLegacy = values.some(
+    (value) => value && typeof value === "object" && !Array.isArray(value) &&
+      ("name" in value || "reasoning" in value || "thinkingLevelMap" in value || "input" in value || "contextWindow" in value || "maxTokens" in value || "cost" in value || "compat" in value),
+  );
+  return isLegacy
+    ? { [DEFAULT_LOCAL_ENDPOINT_ID]: object as Record<string, ModelProfile> }
+    : object as EndpointProfiles;
+}
+
+async function loadProfiles(): Promise<EndpointProfiles> {
   try {
-    const raw = await readFile(PROFILES_PATH, "utf8");
-    return JSON.parse(raw);
+    return normalizeProfiles(JSON.parse(await readFile(PROFILES_PATH, "utf8")));
   } catch {
     // File doesn't exist yet or is invalid — return empty
     return {};
   }
+}
+
+async function loadEndpoints(): Promise<EndpointConfig> {
+  try {
+    const raw = await readFile(ENDPOINTS_PATH, "utf8");
+    const parsed = JSON.parse(raw) as EndpointConfig;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).length === 0) {
+      throw new Error("expected a non-empty object of endpoint definitions");
+    }
+    for (const [id, endpoint] of Object.entries(parsed)) {
+      if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`invalid endpoint ID: ${id}`);
+      if (!endpoint || typeof endpoint !== "object" || typeof endpoint.baseUrl !== "string") {
+        throw new Error(`endpoint ${id} must define a baseUrl`);
+      }
+    }
+    return parsed;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // Create the default configuration below when the file is missing.
+  }
+
+  const port = process.env.LM_STUDIO_PORT ?? DEFAULT_LOCAL_PORT;
+  const endpoints: EndpointConfig = {
+    [DEFAULT_LOCAL_ENDPOINT_ID]: {
+      name: "Local LM Studio",
+      baseUrl: `http://localhost:${port}/v1`,
+    },
+  };
+  await writeFile(ENDPOINTS_PATH, JSON.stringify(endpoints, null, 2) + "\n");
+  return endpoints;
+}
+
+function endpointProviderId(endpointId: string): string {
+  return `${endpointId}/lmstudio`;
+}
+
+function endpointBaseUrl(endpoint: LmStudioEndpoint): string {
+  return endpoint.baseUrl.replace(/\/$/, "");
+}
+
+function isLmStudioProvider(provider?: string): boolean {
+  return provider === "lmstudio" || provider?.endsWith("/lmstudio") === true;
 }
 
 // Build a complete model definition by merging defaults with profile overrides
@@ -226,7 +295,7 @@ function formatJsonValue(value: unknown): string {
 
 function buildModelInfoLines(
   model: ProviderModelConfig & { provider?: string },
-  options: { full: boolean; metadataSource?: string; thinkingLevel?: string },
+  options: { full: boolean; metadataSource?: string; thinkingLevel?: string; endpointName?: string },
 ): string[] {
   if (!options.full) {
     return [
@@ -236,8 +305,11 @@ function buildModelInfoLines(
       `  contextWindow:    ${model.contextWindow}`,
       `  maxTokens:        ${model.maxTokens}`,
       `  input:            ${formatInputSummary(model.input, model.reasoning ?? false, options.thinkingLevel)}`,
+      ...(isLmStudioProvider(model.provider) && options.endpointName
+        ? [`  endpoint:         ${options.endpointName}`]
+        : []),
       ...(hasNonzeroCost(model.cost) ? formatCostLines(model.cost, { full: false }) : []),
-      ...(model.provider === "lmstudio" && options.metadataSource ? [`  source:           ${options.metadataSource}`] : []),
+      ...(isLmStudioProvider(model.provider) && options.metadataSource ? [`  source:           ${options.metadataSource}`] : []),
     ];
   }
 
@@ -248,6 +320,9 @@ function buildModelInfoLines(
     `  ID:               ${model.id}`,
     `  API:              ${model.api ?? "provider default"}`,
     `  Base URL:         ${model.baseUrl ?? "provider default"}`,
+    ...(isLmStudioProvider(model.provider) && options.endpointName
+      ? [`  Endpoint:         ${options.endpointName}`]
+      : []),
     "",
     "Token Limits",
     `  Context window:   ${model.contextWindow}`,
@@ -265,7 +340,7 @@ function buildModelInfoLines(
     "",
     "Compatibility Metadata",
     ...formatJsonValue(model.compat).split("\n").map((line) => `  ${line}`),
-    ...(model.provider === "lmstudio"
+    ...(isLmStudioProvider(model.provider)
       ? [
           "",
           "LM Studio Metadata",
@@ -342,11 +417,50 @@ class ModelInfoFullOverlay implements Component {
   }
 }
 
+class SyncResultOverlay implements Component {
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly lines: string[],
+    private readonly done: () => void,
+  ) {}
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, "escape") || data.toLowerCase() === "q" || matchesKey(data, "enter")) {
+      this.done();
+    }
+  }
+
+  render(width: number): string[] {
+    const th = this.theme;
+    const innerWidth = Math.max(1, width - 2);
+    const border = (text: string) => th.fg("dim", text);
+    const fitLine = (text: string): string => {
+      const truncated = truncateToWidth(text, innerWidth, "...", true);
+      return truncated + " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
+    };
+
+    const title = truncateToWidth(" LM Studio Sync ", innerWidth, "...", true);
+    const titlePad = Math.max(0, innerWidth - visibleWidth(title));
+    const result: string[] = [border("╭") + th.fg("accent", title) + border(`${"─".repeat(titlePad)}╮`)];
+    for (const line of this.lines.slice(1)) {
+      result.push(border("│") + fitLine(` ${line}`) + border("│"));
+    }
+    result.push(border("├") + border("─".repeat(innerWidth)) + border("┤"));
+    result.push(border("│") + fitLine(th.fg("dim", " q/Esc/Enter close ")) + border("│"));
+    result.push(border("╰") + border("─".repeat(innerWidth)) + border("╯"));
+    return result;
+  }
+}
+
 // ── Extension ───────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
-  const port = process.env.LM_STUDIO_PORT ?? "1234";
-  const baseUrl = `http://localhost:${port}/v1`;
+  // Remove the pre-multi-endpoint registration and its persisted catalog.
+  pi.unregisterProvider("lmstudio");
+  const endpoints = await loadEndpoints();
   let infoVisible = false;
 
   // Models we already prompted about this session (add or skip).
@@ -356,7 +470,10 @@ export default async function (pi: ExtensionAPI) {
   const promptedModels = new Set<string>();
 
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.notify(`LM Studio sync: listening on ${baseUrl}`, "info");
+    ctx.ui.notify(
+      `LM Studio sync: ${Object.keys(endpoints).length} endpoint${Object.keys(endpoints).length === 1 ? "" : "s"} configured`,
+      "info",
+    );
   });
 
   // ── Prompt to add a profile when a model is explicitly selected ─────────
@@ -368,15 +485,18 @@ export default async function (pi: ExtensionAPI) {
     const model = event.model;
 
     if (event.source === "restore") return;
-    if (model.provider !== "lmstudio") return;
-    if (promptedModels.has(model.id)) return;
+    if (!isLmStudioProvider(model.provider)) return;
+    if (promptedModels.has(`${model.provider}:${model.id}`)) return;
     if (!ctx.hasUI) return;
 
+    const endpointId = model.provider?.endsWith("/lmstudio")
+      ? model.provider.slice(0, -"/lmstudio".length)
+      : DEFAULT_LOCAL_ENDPOINT_ID;
     const profiles = await loadProfiles();
-    if (profiles[model.id]) return;
+    if (profiles[endpointId]?.[model.id]) return;
 
     // Remember that we asked, so we don't nag again this session
-    promptedModels.add(model.id);
+    promptedModels.add(`${model.provider}:${model.id}`);
 
     const choice = await ctx.ui.select(
       `No profile for ${model.id} — add one?`,
@@ -388,7 +508,7 @@ export default async function (pi: ExtensionAPI) {
     }
 
     // Load existing profiles, or start empty if the file doesn't exist yet.
-    let profilesJson: Record<string, ModelProfile> = {};
+    let profilesJson: EndpointProfiles = {};
     let raw: string | undefined;
     try {
       raw = await readFile(PROFILES_PATH, "utf8");
@@ -397,7 +517,7 @@ export default async function (pi: ExtensionAPI) {
     }
     if (raw !== undefined) {
       try {
-        profilesJson = JSON.parse(raw);
+        profilesJson = normalizeProfiles(JSON.parse(raw));
       } catch (err) {
         // Don't silently overwrite a broken file
         ctx.ui.notify(
@@ -409,7 +529,8 @@ export default async function (pi: ExtensionAPI) {
     }
 
     // Prefill the editor with the current file plus a draft entry
-    profilesJson[model.id] = makeDraftProfile(model.id);
+    if (!profilesJson[endpointId]) profilesJson[endpointId] = {};
+    profilesJson[endpointId][model.id] = makeDraftProfile(model.id);
     const edited = await ctx.ui.editor(
       `Add profile for ${model.id}`,
       JSON.stringify(profilesJson, null, 2) + "\n",
@@ -438,68 +559,115 @@ export default async function (pi: ExtensionAPI) {
     pi.sendUserMessage("/lmstudio-reload", { deliverAs: "followUp" });
   });
 
-  pi.registerProvider("lmstudio", {
-    baseUrl,
-    apiKey: "lmstudio",
-    api: "openai-completions",
-    // @ts-expect-error Pi accepts provider-level compat at runtime, but the current ProviderConfig type does not expose it.
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
-    },
-    async refreshModels({ signal }) {
-      const response = await fetch(`${baseUrl}/models`, { signal });
-      if (!response.ok) return [];
+  const profiles = await loadProfiles();
+  for (const [endpointId, endpoint] of Object.entries(endpoints)) {
+    const providerName = endpointProviderId(endpointId);
+    const baseUrl = endpointBaseUrl(endpoint);
+    pi.registerProvider(providerName, {
+      baseUrl,
+      apiKey: "lmstudio",
+      api: "openai-completions",
+      // @ts-expect-error Pi accepts provider-level compat at runtime, but the current ProviderConfig type does not expose it.
+      compat: {
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: false,
+      },
+      async refreshModels({ signal }) {
+        const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
+        const combinedSignal = AbortSignal.any(signal ? [signal, timeout] : [timeout]);
+        try {
+          const response = await fetch(`${baseUrl}/models`, { signal: combinedSignal });
+          if (!response.ok) return [];
 
-      const payload = (await response.json()) as {
-        data: Array<{ id: string; object?: string; owned_by?: string }>;
-      };
+          const payload = (await response.json()) as {
+            data: Array<{ id: string; object?: string; owned_by?: string }>;
+          };
 
-      const profiles = await loadProfiles();
-
-      return payload.data
-        .filter((m) => !isEmbeddingModel(m.id))
-        .map((m) => buildModel(m.id, profiles).model);
-    },
-  });
+          return payload.data
+            .filter((m) => !isEmbeddingModel(m.id))
+            .map((m) => buildModel(m.id, profiles[endpointId] ?? {}).model);
+        } catch {
+          return [];
+        }
+      },
+    });
+  }
 
   // ── /sync-models ────────────────────────────────────────────────────────
 
   pi.registerCommand("sync-models", {
-    description: "Refresh model list from LM Studio",
+    description: "Refresh model lists from all LM Studio endpoints",
     handler: async (_args, ctx) => {
+      const profiles = await loadProfiles();
+      const results = await Promise.all(Object.entries(endpoints).map(async ([endpointId, endpoint]) => {
+        const baseUrl = endpointBaseUrl(endpoint);
+        const label = endpoint.name ?? endpointId;
+        try {
+          const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
+          const signal = AbortSignal.any(ctx.signal ? [ctx.signal, timeout] : [timeout]);
+          const response = await fetch(`${baseUrl}/models`, { signal });
+          if (!response.ok) return `${label}: unavailable (${response.status})`;
+
+          const payload = (await response.json()) as { data: Array<{ id: string }> };
+          const chatModels = payload.data.filter((m) => !isEmbeddingModel(m.id));
+          const endpointProfiles = profiles[endpointId] ?? {};
+          const profiled = chatModels.filter((m) => buildModel(m.id, endpointProfiles).source === "profile").length;
+          return `${label}: ${chatModels.length} models (${profiled} profiled, ${chatModels.length - profiled} defaults)`;
+        } catch {
+          return `${label}: unavailable`;
+        }
+      }));
+
+      const lines = [
+        "LM Studio Sync Results",
+        "",
+        ...results,
+      ];
+      await ctx.ui.custom<void>(
+        (tui, theme, _keybindings, done) => new SyncResultOverlay(tui, theme, lines, done),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "bottom-center",
+            width: "100%",
+            maxHeight: "50%",
+            margin: { left: 0, right: 0, bottom: 3 },
+          },
+        },
+      );
+      // Re-register providers so the live model catalogs reflect this sync.
+      // This is the final operation because reload invalidates ctx.
+      await ctx.reload();
+    },
+  });
+
+  // ── /lmstudio-endpoints ────────────────────────────────────────────────
+
+  pi.registerCommand("lmstudio-endpoints", {
+    description: "Open LM Studio endpoints for editing",
+    handler: async (_args, ctx) => {
+      const edited = await ctx.ui.editor(
+        `Edit endpoints (${ENDPOINTS_PATH})`,
+        JSON.stringify(endpoints, null, 2) + "\n",
+      );
+      if (edited === undefined) return;
+
       try {
-        const response = await fetch(`${baseUrl}/models`, { signal: ctx.signal });
-        if (!response.ok) {
-          ctx.ui.notify(`LM Studio returned ${response.status} — is it running?`, "error");
-          return;
+        const parsed = JSON.parse(edited);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).length === 0) {
+          throw new Error("expected a non-empty object of endpoint definitions");
         }
-
-        const payload = (await response.json()) as {
-          data: Array<{ id: string }>;
-        };
-
-        const profiles = await loadProfiles();
-        const chatModels = payload.data.filter((m) => !isEmbeddingModel(m.id));
-
-        const profiled: string[] = [];
-        const defaulted: string[] = [];
-        for (const m of chatModels) {
-          const { source } = buildModel(m.id, profiles);
-          if (source === "profile") profiled.push(m.id);
-          else defaulted.push(m.id);
+        for (const [id, endpoint] of Object.entries(parsed)) {
+          if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`invalid endpoint ID: ${id}`);
+          if (!endpoint || typeof endpoint !== "object" || typeof (endpoint as { baseUrl?: unknown }).baseUrl !== "string") {
+            throw new Error(`endpoint ${id} must define a baseUrl`);
+          }
         }
-
-        ctx.ui.notify(
-          `Found ${chatModels.length} chat models (${profiled.length} profiled, ${defaulted.length} defaults)`,
-          "info",
-        );
-        ctx.ui.setStatus("lmstudio", `Synced ${chatModels.length} models`);
+        await writeFile(ENDPOINTS_PATH, edited);
+        ctx.ui.notify("Endpoints saved — reloading to apply", "info");
+        await ctx.reload();
       } catch (err) {
-        ctx.ui.notify(
-          `Failed to reach LM Studio: ${err instanceof Error ? err.message : String(err)}`,
-          "error",
-        );
+        ctx.ui.notify(`Invalid endpoint configuration: ${err instanceof Error ? err.message : String(err)}`, "error");
       }
     },
   });
@@ -527,10 +695,13 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const profiles = model.provider === "lmstudio" ? await loadProfiles() : undefined;
+      const endpointId = model.provider?.endsWith("/lmstudio")
+        ? model.provider.slice(0, -"/lmstudio".length)
+        : DEFAULT_LOCAL_ENDPOINT_ID;
+      const profiles = isLmStudioProvider(model.provider) ? await loadProfiles() : undefined;
       const metadataSource =
-        model.provider === "lmstudio"
-          ? profiles?.[model.id]
+        isLmStudioProvider(model.provider)
+          ? profiles?.[endpointId]?.[model.id]
             ? "LM Studio profile metadata"
             : "LM Studio default metadata"
           : "Pi model registry";
@@ -539,6 +710,7 @@ export default async function (pi: ExtensionAPI) {
         full: false,
         metadataSource,
         thinkingLevel: ctx.thinkingLevel,
+        endpointName: isLmStudioProvider(model.provider) ? endpoints[endpointId]?.name ?? model.baseUrl : undefined,
       }));
       infoVisible = true;
     },
@@ -558,10 +730,13 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const profiles = model.provider === "lmstudio" ? await loadProfiles() : undefined;
+      const endpointId = model.provider?.endsWith("/lmstudio")
+        ? model.provider.slice(0, -"/lmstudio".length)
+        : DEFAULT_LOCAL_ENDPOINT_ID;
+      const profiles = isLmStudioProvider(model.provider) ? await loadProfiles() : undefined;
       const metadataSource =
-        model.provider === "lmstudio"
-          ? profiles?.[model.id]
+        isLmStudioProvider(model.provider)
+          ? profiles?.[endpointId]?.[model.id]
             ? "LM Studio profile metadata"
             : "LM Studio default metadata"
           : "Pi model registry";
@@ -569,6 +744,7 @@ export default async function (pi: ExtensionAPI) {
         full: true,
         metadataSource,
         thinkingLevel: ctx.thinkingLevel,
+        endpointName: isLmStudioProvider(model.provider) ? endpoints[endpointId]?.name ?? model.baseUrl : undefined,
       });
 
       await ctx.ui.custom<void>(
@@ -597,13 +773,15 @@ export default async function (pi: ExtensionAPI) {
         content = await readFile(PROFILES_PATH, "utf8");
       } catch {
         const template = {
-          // Example: customize a model's settings
-          // "qwen/qwen3.6-27b": {
-          //   "name": "Qwen 3.6 27B",
-          //   "reasoning": true,
-          //   "thinkingLevelMap": { "high": "high", "max": "max" },
-          //   "contextWindow": 131072,
-          //   "maxTokens": 32768
+          // Example: customize a model's settings for an endpoint
+          // "local": {
+          //   "qwen/qwen3.6-27b": {
+          //     "name": "Qwen 3.6 27B",
+          //     "reasoning": true,
+          //     "thinkingLevelMap": { "high": "high", "max": "max" },
+          //     "contextWindow": 131072,
+          //     "maxTokens": 32768
+          //   }
           // }
         };
         content = JSON.stringify(template, null, 2) + "\n";

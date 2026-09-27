@@ -1,19 +1,30 @@
 # lmstudio-sync
 
-A [Pi](https://pi.dev) extension that registers an LM Studio provider, refreshes the model list from LM Studio, and lets you maintain per-model profile metadata.
+A [Pi](https://pi.dev) extension that registers one provider per LM Studio endpoint, refreshes model lists, and lets you maintain endpoint-specific profile metadata.
 
 ## Requirements
 
 - Pi with Node.js 24 or newer
 - LM Studio running its local OpenAI-compatible server
 
-By default, the extension connects to:
+On first run, the extension creates an endpoint configuration at:
 
 ```text
-http://localhost:1234/v1
+~/.pi/agent/lmstudio-endpoints.json
 ```
 
-Set `LM_STUDIO_PORT` to use a different port.
+It initially contains the local endpoint:
+
+```json
+{
+  "local": {
+    "name": "Local LM Studio",
+    "baseUrl": "http://localhost:1234/v1"
+  }
+}
+```
+
+Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
 
 ## Install
 
@@ -43,11 +54,12 @@ pi -e /absolute/path/to/lmstudio-sync
 
 ## Usage
 
-The extension registers the `lmstudio` provider and discovers chat models from LM Studio's `/v1/models` endpoint.
+The extension registers one provider per configured endpoint and discovers chat models from each endpoint's `/v1/models` endpoint. Unavailable endpoints contribute no models until the next refresh.
 
 Commands:
 
-- `/sync-models` — refresh model list from LM Studio
+- `/sync-models` — refresh model lists from all LM Studio endpoints
+- `/lmstudio-endpoints` — edit LM Studio endpoint configuration
 - `/model-info` — toggle the current model's brief settings widget
 - `/model-info-full` — show the current model's full settings in a scrollable overlay
 - `/lmstudio-profiles` — edit LM Studio model profiles
@@ -59,7 +71,19 @@ Profiles are stored in:
 ~/.pi/agent/lmstudio-profiles.json
 ```
 
-When selecting an LM Studio model without a profile, the extension can prompt you to add one.
+New profiles are scoped by endpoint:
+
+```json
+{
+  "m3max": {
+    "qwen/qwen3-8b": {
+      "contextWindow": 131072
+    }
+  }
+}
+```
+
+For backward compatibility, the original flat profile format is interpreted as belonging to the `local` endpoint. When selecting an LM Studio model without a profile, the extension can prompt you to add one.
 
 ## Development
 
