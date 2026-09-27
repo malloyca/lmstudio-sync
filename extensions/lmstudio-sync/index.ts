@@ -3,13 +3,14 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const PROFILES_PATH = join(CONFIG_DIR, "lmstudio-profiles.json");
 const ENDPOINTS_PATH = join(CONFIG_DIR, "lmstudio-endpoints.json");
+const SYNC_RESULT_PATH = join(CONFIG_DIR, "lmstudio-sync-result.txt");
 const DEFAULT_LOCAL_ENDPOINT_ID = "local";
 const DEFAULT_LOCAL_PORT = "1234";
 const ENDPOINT_TIMEOUT_MS = 5_000;
@@ -190,6 +191,16 @@ async function loadProfiles(): Promise<EndpointProfiles> {
   } catch {
     // File doesn't exist yet or is invalid — return empty
     return {};
+  }
+}
+
+async function consumeSyncResult(): Promise<string | undefined> {
+  try {
+    const result = (await readFile(SYNC_RESULT_PATH, "utf8")).trim();
+    await unlink(SYNC_RESULT_PATH);
+    return result || undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -423,6 +434,7 @@ export default async function (pi: ExtensionAPI) {
   // Remove the pre-multi-endpoint registration and its persisted catalog.
   pi.unregisterProvider("lmstudio");
   const endpoints = await loadEndpoints();
+  const pendingSyncResult = await consumeSyncResult();
   let infoVisible = false;
 
   // Models we already prompted about this session (add or skip).
@@ -436,6 +448,10 @@ export default async function (pi: ExtensionAPI) {
       `LM Studio sync: ${Object.keys(endpoints).length} endpoint${Object.keys(endpoints).length === 1 ? "" : "s"} configured`,
       "info",
     );
+    if (pendingSyncResult) {
+      ctx.ui.notify(pendingSyncResult, "info");
+      ctx.ui.setStatus("lmstudio", pendingSyncResult);
+    }
   });
 
   // ── Prompt to add a profile when a model is explicitly selected ─────────
@@ -581,20 +597,10 @@ export default async function (pi: ExtensionAPI) {
       }));
 
       const summary = results.join("; ");
-      // Queue reporting before reload because ctx becomes stale after reload.
-      pi.sendUserMessage(`/lmstudio-sync-result ${encodeURIComponent(summary)}`, { deliverAs: "followUp" });
+      // Persist reporting before reload because ctx becomes stale after reload.
+      await writeFile(SYNC_RESULT_PATH, summary + "\n");
       // Re-register providers so the live model catalogs reflect this sync.
       await ctx.reload();
-    },
-  });
-
-  pi.registerCommand("lmstudio-sync-result", {
-    description: "Display the result of the most recent LM Studio sync",
-    handler: async (args, ctx) => {
-      const summary = decodeURIComponent(args.trim());
-      if (!summary) return;
-      ctx.ui.notify(summary, "info");
-      ctx.ui.setStatus("lmstudio", summary);
     },
   });
 
