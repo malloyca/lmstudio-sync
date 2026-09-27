@@ -308,7 +308,7 @@ class ModelInfoFullOverlay implements Component {
   render(width: number): string[] {
     const th = this.theme;
     const innerWidth = Math.max(1, width - 2);
-    const border = (text: string) => th.fg("border", text);
+    const border = (text: string) => th.fg("dim", text);
     const fitLine = (text: string): string => {
       const truncated = truncateToWidth(text, innerWidth, "...", true);
       return truncated + " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
@@ -575,7 +575,12 @@ export default async function (pi: ExtensionAPI) {
         (tui, theme, _keybindings, done) => new ModelInfoFullOverlay(tui, theme, lines, done),
         {
           overlay: true,
-          overlayOptions: { anchor: "center", width: "80%", maxHeight: "80%" },
+          overlayOptions: {
+            anchor: "bottom-center",
+            width: "100%",
+            maxHeight: "80%",
+            margin: { left: 0, right: 0, bottom: 3 },
+          },
         },
       );
     },
