@@ -1,4 +1,6 @@
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
+import type { Component, TUI } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
@@ -217,6 +219,129 @@ function makeDraftProfile(id: string): ModelProfile {
   };
 }
 
+function formatJsonValue(value: unknown): string {
+  if (value === undefined) return "none";
+  return JSON.stringify(value, null, 2) ?? "none";
+}
+
+function buildModelInfoLines(
+  model: ProviderModelConfig & { provider?: string },
+  options: { full: boolean; metadataSource?: string; thinkingLevel?: string },
+): string[] {
+  if (!options.full) {
+    return [
+      "===== CURRENT MODEL INFO =====",
+      `Model: ${model.name ?? model.id} (${model.provider ?? "unknown provider"})`,
+      `  id:               ${model.id}`,
+      `  contextWindow:    ${model.contextWindow}`,
+      `  maxTokens:        ${model.maxTokens}`,
+      `  input:            ${formatInputSummary(model.input, model.reasoning ?? false, options.thinkingLevel)}`,
+      ...(hasNonzeroCost(model.cost) ? formatCostLines(model.cost, { full: false }) : []),
+      ...(model.provider === "lmstudio" && options.metadataSource ? [`  source:           ${options.metadataSource}`] : []),
+    ];
+  }
+
+  return [
+    "Current Model",
+    `  Name:             ${model.name ?? model.id}`,
+    `  Provider:         ${model.provider ?? "unknown"}`,
+    `  ID:               ${model.id}`,
+    `  API:              ${model.api ?? "provider default"}`,
+    `  Base URL:         ${model.baseUrl ?? "provider default"}`,
+    "",
+    "Token Limits",
+    `  Context window:   ${model.contextWindow}`,
+    `  Max output:       ${model.maxTokens}`,
+    "",
+    "Inputs and Reasoning",
+    `  Input:            ${model.input.join(", ")}`,
+    `  Reasoning:        ${model.reasoning ? "yes" : "no"}`,
+    `  Thinking level:   ${options.thinkingLevel ?? "default"}`,
+    "  Thinking map:",
+    ...formatJsonValue(model.thinkingLevelMap).split("\n").map((line) => `    ${line}`),
+    "",
+    "Cost ($ / million tokens)",
+    ...formatCostLines(model.cost, { full: true }),
+    "",
+    "Compatibility Metadata",
+    ...formatJsonValue(model.compat).split("\n").map((line) => `  ${line}`),
+    ...(model.provider === "lmstudio"
+      ? [
+          "",
+          "LM Studio Metadata",
+          `  Source:           ${options.metadataSource ?? "unknown"}`,
+          `  Profiles file:    ${PROFILES_PATH}`,
+        ]
+      : []),
+  ];
+}
+
+class ModelInfoFullOverlay implements Component {
+  private scrollOffset = 0;
+  private readonly maxVisibleLines = 18;
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly lines: string[],
+    private readonly done: () => void,
+  ) {}
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, "escape") || data.toLowerCase() === "q") {
+      this.done();
+      return;
+    }
+    if (matchesKey(data, "up")) {
+      this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.scrollOffset = Math.min(this.maxScrollOffset(), this.scrollOffset + 1);
+      this.tui.requestRender();
+    }
+  }
+
+  render(width: number): string[] {
+    const th = this.theme;
+    const innerWidth = Math.max(1, width - 2);
+    const border = (text: string) => th.fg("border", text);
+    const fitLine = (text: string): string => {
+      const truncated = truncateToWidth(text, innerWidth, "...", true);
+      return truncated + " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
+    };
+
+    this.scrollOffset = Math.min(this.scrollOffset, this.maxScrollOffset());
+    const visibleLines = this.lines.slice(this.scrollOffset, this.scrollOffset + this.maxVisibleLines);
+    const canScrollUp = this.scrollOffset > 0;
+    const canScrollDown = this.scrollOffset < this.maxScrollOffset();
+    const scrollInfo = canScrollUp || canScrollDown
+      ? ` ↑ ${this.scrollOffset} · ↓ ${this.maxScrollOffset() - this.scrollOffset}`
+      : "";
+    const title = truncateToWidth(` Model Info${scrollInfo} `, innerWidth, "...", true);
+    const titlePad = Math.max(0, innerWidth - visibleWidth(title));
+
+    const result: string[] = [border("╭") + th.fg("accent", title) + border(`${"─".repeat(titlePad)}╮`)];
+    for (const line of visibleLines) {
+      result.push(border("│") + fitLine(` ${line}`) + border("│"));
+    }
+    for (let i = visibleLines.length; i < this.maxVisibleLines; i++) {
+      result.push(border("│") + fitLine("") + border("│"));
+    }
+    result.push(border("├") + border("─".repeat(innerWidth)) + border("┤"));
+    result.push(border("│") + fitLine(th.fg("dim", " ↑/↓ scroll · q/Esc close")) + border("│"));
+    result.push(border("╰") + border("─".repeat(innerWidth)) + border("╯"));
+    return result;
+  }
+
+  private maxScrollOffset(): number {
+    return Math.max(0, this.lines.length - this.maxVisibleLines);
+  }
+}
+
 // ── Extension ───────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
@@ -382,18 +507,14 @@ export default async function (pi: ExtensionAPI) {
   // ── /model-info ────────────────────────────────────────────────────────
 
   pi.registerCommand("model-info", {
-    description: "Show current model's effective settings",
+    description: "Toggle current model's brief settings widget",
     handler: async (args, ctx) => {
-      const mode = args.trim();
-      if (mode !== "" && mode !== "full") {
-        ctx.ui.notify("Usage: /model-info [full] — omit arguments for the brief summary", "error");
+      if (args.trim() !== "") {
+        ctx.ui.notify("Usage: /model-info — for full details, use /model-info-full", "error");
         return;
       }
-      const full = mode === "full";
 
-      // The brief command toggles the widget off when any model-info view is active.
-      // Explicit modes always render that mode, even when the widget is already visible.
-      if (mode === "" && infoVisible) {
+      if (infoVisible) {
         ctx.ui.setWidget("model-info", undefined);
         infoVisible = false;
         ctx.ui.notify("Model info dismissed", "info");
@@ -414,24 +535,49 @@ export default async function (pi: ExtensionAPI) {
             : "LM Studio default metadata"
           : "Pi model registry";
 
-      const lines = [
-        "===== CURRENT MODEL INFO =====",
-        `Model: ${model.name ?? model.id} (${model.provider})`,
-        `  id:               ${model.id}`,
-        ...(full ? [`  api:              ${model.api}`] : []),
-        ...(full ? [`  baseUrl:          ${model.baseUrl}`] : []),
-        `  contextWindow:    ${model.contextWindow}`,
-        `  maxTokens:        ${model.maxTokens}`,
-        `  input:            ${formatInputSummary(model.input, model.reasoning ?? false, ctx.thinkingLevel)}`,
-        ...(full ? [`  thinkingLevelMap: ${JSON.stringify(model.thinkingLevelMap) ?? "none"}`] : []),
-        ...(full ? [`  compat:           ${JSON.stringify(model.compat) ?? "none"}`] : []),
-        ...(full || hasNonzeroCost(model.cost) ? formatCostLines(model.cost, { full }) : []),
-        ...(model.provider === "lmstudio" ? [`  source:           ${metadataSource}`] : []),
-        ...(full && model.provider === "lmstudio" ? [`  profilesFile:     ${PROFILES_PATH}`] : []),
-      ];
-
-      ctx.ui.setWidget("model-info", lines);
+      ctx.ui.setWidget("model-info", buildModelInfoLines(model, {
+        full: false,
+        metadataSource,
+        thinkingLevel: ctx.thinkingLevel,
+      }));
       infoVisible = true;
+    },
+  });
+
+  pi.registerCommand("model-info-full", {
+    description: "Show current model's full settings in a scrollable overlay",
+    handler: async (args, ctx) => {
+      if (args.trim() !== "") {
+        ctx.ui.notify("Usage: /model-info-full", "error");
+        return;
+      }
+
+      const model = ctx.model;
+      if (!model) {
+        ctx.ui.notify("No model currently selected", "error");
+        return;
+      }
+
+      const profiles = model.provider === "lmstudio" ? await loadProfiles() : undefined;
+      const metadataSource =
+        model.provider === "lmstudio"
+          ? profiles?.[model.id]
+            ? "LM Studio profile metadata"
+            : "LM Studio default metadata"
+          : "Pi model registry";
+      const lines = buildModelInfoLines(model, {
+        full: true,
+        metadataSource,
+        thinkingLevel: ctx.thinkingLevel,
+      });
+
+      await ctx.ui.custom<void>(
+        (tui, theme, _keybindings, done) => new ModelInfoFullOverlay(tui, theme, lines, done),
+        {
+          overlay: true,
+          overlayOptions: { anchor: "center", width: "80%", maxHeight: "80%" },
+        },
+      );
     },
   });
 
