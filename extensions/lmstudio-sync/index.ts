@@ -3,14 +3,13 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const PROFILES_PATH = join(CONFIG_DIR, "lmstudio-profiles.json");
 const ENDPOINTS_PATH = join(CONFIG_DIR, "lmstudio-endpoints.json");
-const SYNC_RESULT_PATH = join(CONFIG_DIR, "lmstudio-sync-result.txt");
 const DEFAULT_LOCAL_ENDPOINT_ID = "local";
 const DEFAULT_LOCAL_PORT = "1234";
 const ENDPOINT_TIMEOUT_MS = 5_000;
@@ -191,16 +190,6 @@ async function loadProfiles(): Promise<EndpointProfiles> {
   } catch {
     // File doesn't exist yet or is invalid — return empty
     return {};
-  }
-}
-
-async function consumeSyncResult(): Promise<string | undefined> {
-  try {
-    const result = (await readFile(SYNC_RESULT_PATH, "utf8")).trim();
-    await unlink(SYNC_RESULT_PATH);
-    return result || undefined;
-  } catch {
-    return undefined;
   }
 }
 
@@ -428,13 +417,50 @@ class ModelInfoFullOverlay implements Component {
   }
 }
 
+class SyncResultOverlay implements Component {
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly lines: string[],
+    private readonly done: () => void,
+  ) {}
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, "escape") || data.toLowerCase() === "q" || matchesKey(data, "enter")) {
+      this.done();
+    }
+  }
+
+  render(width: number): string[] {
+    const th = this.theme;
+    const innerWidth = Math.max(1, width - 2);
+    const border = (text: string) => th.fg("dim", text);
+    const fitLine = (text: string): string => {
+      const truncated = truncateToWidth(text, innerWidth, "...", true);
+      return truncated + " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
+    };
+
+    const title = truncateToWidth(" LM Studio Sync ", innerWidth, "...", true);
+    const titlePad = Math.max(0, innerWidth - visibleWidth(title));
+    const result: string[] = [border("╭") + th.fg("accent", title) + border(`${"─".repeat(titlePad)}╮`)];
+    for (const line of this.lines.slice(1)) {
+      result.push(border("│") + fitLine(` ${line}`) + border("│"));
+    }
+    result.push(border("├") + border("─".repeat(innerWidth)) + border("┤"));
+    result.push(border("│") + fitLine(th.fg("dim", " q/Esc/Enter close ")) + border("│"));
+    result.push(border("╰") + border("─".repeat(innerWidth)) + border("╯"));
+    return result;
+  }
+}
+
 // ── Extension ───────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
   // Remove the pre-multi-endpoint registration and its persisted catalog.
   pi.unregisterProvider("lmstudio");
   const endpoints = await loadEndpoints();
-  const pendingSyncResult = await consumeSyncResult();
   let infoVisible = false;
 
   // Models we already prompted about this session (add or skip).
@@ -448,10 +474,6 @@ export default async function (pi: ExtensionAPI) {
       `LM Studio sync: ${Object.keys(endpoints).length} endpoint${Object.keys(endpoints).length === 1 ? "" : "s"} configured`,
       "info",
     );
-    if (pendingSyncResult) {
-      ctx.ui.notify(pendingSyncResult, "info");
-      ctx.ui.setStatus("lmstudio", pendingSyncResult);
-    }
   });
 
   // ── Prompt to add a profile when a model is explicitly selected ─────────
@@ -596,10 +618,25 @@ export default async function (pi: ExtensionAPI) {
         }
       }));
 
-      const summary = results.join("; ");
-      // Persist reporting before reload because ctx becomes stale after reload.
-      await writeFile(SYNC_RESULT_PATH, summary + "\n");
+      const lines = [
+        "LM Studio Sync Results",
+        "",
+        ...results,
+      ];
+      await ctx.ui.custom<void>(
+        (tui, theme, _keybindings, done) => new SyncResultOverlay(tui, theme, lines, done),
+        {
+          overlay: true,
+          overlayOptions: {
+            anchor: "bottom-center",
+            width: "100%",
+            maxHeight: "50%",
+            margin: { left: 0, right: 0, bottom: 3 },
+          },
+        },
+      );
       // Re-register providers so the live model catalogs reflect this sync.
+      // This is the final operation because reload invalidates ctx.
       await ctx.reload();
     },
   });
