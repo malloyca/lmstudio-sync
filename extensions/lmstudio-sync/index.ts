@@ -581,9 +581,18 @@ export default async function (pi: ExtensionAPI) {
       }));
 
       const summary = results.join("; ");
+      // Queue reporting before reload because ctx becomes stale after reload.
+      pi.sendUserMessage(`/lmstudio-sync-result ${encodeURIComponent(summary)}`, { deliverAs: "followUp" });
       // Re-register providers so the live model catalogs reflect this sync.
-      // Report after reload; reload clears transient notifications.
       await ctx.reload();
+    },
+  });
+
+  pi.registerCommand("lmstudio-sync-result", {
+    description: "Display the result of the most recent LM Studio sync",
+    handler: async (args, ctx) => {
+      const summary = decodeURIComponent(args.trim());
+      if (!summary) return;
       ctx.ui.notify(summary, "info");
       ctx.ui.setStatus("lmstudio", summary);
     },
