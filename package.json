@@ -1,0 +1,37 @@
+{
+  "name": "lmstudio-sync",
+  "version": "0.1.0",
+  "description": "Pi extension that syncs LM Studio models and profile metadata",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "lmstudio",
+    "models"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "extensions",
+    "LICENSE",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/lmstudio-sync/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
