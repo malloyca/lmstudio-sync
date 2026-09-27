@@ -580,10 +580,12 @@ export default async function (pi: ExtensionAPI) {
         }
       }));
 
-      ctx.ui.notify(results.join("; "), "info");
-      ctx.ui.setStatus("lmstudio", `Synced ${Object.keys(endpoints).length} endpoints`);
+      const summary = results.join("; ");
       // Re-register providers so the live model catalogs reflect this sync.
+      // Report after reload; reload clears transient notifications.
       await ctx.reload();
+      ctx.ui.notify(summary, "info");
+      ctx.ui.setStatus("lmstudio", summary);
     },
   });
 
