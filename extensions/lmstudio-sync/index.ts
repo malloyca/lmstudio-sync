@@ -168,25 +168,10 @@ function formatName(id: string): string {
 
 // ── Profile loading ─────────────────────────────────────────────────────────
 
-function normalizeProfiles(parsed: unknown): EndpointProfiles {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-  const object = parsed as Record<string, unknown>;
-
-  // Backward compatibility: the original format was model -> profile and
-  // implicitly referred to the local endpoint.
-  const values = Object.values(object);
-  const isLegacy = values.some(
-    (value) => value && typeof value === "object" && !Array.isArray(value) &&
-      ("name" in value || "reasoning" in value || "thinkingLevelMap" in value || "input" in value || "contextWindow" in value || "maxTokens" in value || "cost" in value || "compat" in value),
-  );
-  return isLegacy
-    ? { [DEFAULT_LOCAL_ENDPOINT_ID]: object as Record<string, ModelProfile> }
-    : object as EndpointProfiles;
-}
-
 async function loadProfiles(): Promise<EndpointProfiles> {
   try {
-    return normalizeProfiles(JSON.parse(await readFile(PROFILES_PATH, "utf8")));
+    const parsed = JSON.parse(await readFile(PROFILES_PATH, "utf8")) as EndpointProfiles;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
     // File doesn't exist yet or is invalid — return empty
     return {};
@@ -517,7 +502,7 @@ export default async function (pi: ExtensionAPI) {
     }
     if (raw !== undefined) {
       try {
-        profilesJson = normalizeProfiles(JSON.parse(raw));
+        profilesJson = JSON.parse(raw) as EndpointProfiles;
       } catch (err) {
         // Don't silently overwrite a broken file
         ctx.ui.notify(
