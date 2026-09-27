@@ -44,6 +44,68 @@ function isEmbeddingModel(id: string): boolean {
   return EMBEDDING_PATTERNS.some((p) => lower.includes(p));
 }
 
+function hasNonzeroCost(cost: ProviderModelConfig["cost"]): boolean {
+  return (
+    cost.input !== 0 ||
+    cost.output !== 0 ||
+    cost.cacheRead !== 0 ||
+    cost.cacheWrite !== 0 ||
+    cost.tiers?.some((tier) =>
+      tier.input !== 0 ||
+      tier.output !== 0 ||
+      tier.cacheRead !== 0 ||
+      tier.cacheWrite !== 0
+    ) === true
+  );
+}
+
+function formatCostNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(value);
+}
+
+function formatTokenThreshold(tokens: number): string {
+  if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`;
+  if (tokens >= 1_000 && tokens % 1_000 === 0) return `${tokens / 1_000}k`;
+  return String(tokens);
+}
+
+function formatCostParts(
+  cost: ProviderModelConfig["cost"],
+  options: { includeZero: boolean },
+): string {
+  const entries: Array<[string, number]> = [
+    ["input", cost.input],
+    ["output", cost.output],
+    ["cache read", cost.cacheRead],
+    ["cache write", cost.cacheWrite],
+  ];
+  const parts = entries
+    .filter(([, value]) => options.includeZero || value !== 0)
+    .map(([label, value]) => `${label} ${formatCostNumber(value)}`);
+  return parts.length > 0 ? parts.join(", ") : "0";
+}
+
+function formatCostLines(cost: ProviderModelConfig["cost"], options: { full: boolean }): string[] {
+  const includeZero = options.full;
+  return [
+    `  cost ($/M):       ${formatCostParts(cost, { includeZero })}`,
+    ...(cost.tiers ?? []).map(
+      (tier) =>
+        `  tier >${formatTokenThreshold(tier.inputTokensAbove)}:       ${formatCostParts(tier, { includeZero })}`,
+    ),
+  ];
+}
+
+function formatInputSummary(
+  input: ProviderModelConfig["input"],
+  reasoning: boolean,
+  thinkingLevel?: string,
+): string {
+  const inputText = input.join(", ");
+  if (!reasoning) return inputText;
+  return `${inputText} (reasoning${thinkingLevel ? `: ${thinkingLevel}` : ""})`;
+}
+
 // Heuristic: guess if a model supports reasoning based on common naming patterns
 function guessReasoning(id: string): boolean {
   const lower = id.toLowerCase();
@@ -317,14 +379,22 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /lmstudio-info ─────────────────────────────────────────────────────
+  // ── /model-info ────────────────────────────────────────────────────────
 
-  pi.registerCommand("lmstudio-info", {
+  pi.registerCommand("model-info", {
     description: "Show current model's effective settings",
-    handler: async (_args, ctx) => {
-      // If widget is already showing, dismiss it
-      if (infoVisible) {
-        ctx.ui.setWidget("lmstudio-info", undefined);
+    handler: async (args, ctx) => {
+      const mode = args.trim();
+      if (mode !== "" && mode !== "full") {
+        ctx.ui.notify("Usage: /model-info [full] — omit arguments for the brief summary", "error");
+        return;
+      }
+      const full = mode === "full";
+
+      // The brief command toggles the widget off when any model-info view is active.
+      // Explicit modes always render that mode, even when the widget is already visible.
+      if (mode === "" && infoVisible) {
+        ctx.ui.setWidget("model-info", undefined);
         infoVisible = false;
         ctx.ui.notify("Model info dismissed", "info");
         return;
@@ -336,36 +406,32 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const profiles = await loadProfiles();
-      const { model: effective, source } = buildModel(model.id, profiles);
+      const profiles = model.provider === "lmstudio" ? await loadProfiles() : undefined;
+      const metadataSource =
+        model.provider === "lmstudio"
+          ? profiles?.[model.id]
+            ? "LM Studio profile metadata"
+            : "LM Studio default metadata"
+          : "Pi model registry";
 
       const lines = [
-        `Model: ${effective.name ?? model.id}`,
-        `  id:            ${model.id}`,
-        `  contextWindow: ${effective.contextWindow} (${source === "profile" ? "from profile" : "default"})`,
-        `  maxTokens:     ${effective.maxTokens} (${source === "profile" ? "from profile" : "default"})`,
-        `  reasoning:     ${effective.reasoning ?? false} (${source === "profile" ? "from profile" : "default"})`,
-        `  input:         ${(effective.input as string[])?.join(", ") ?? "text"} (${source === "profile" ? "from profile" : "default"})`,
-        `  thinkingLevelMap: ${JSON.stringify(effective.thinkingLevelMap) ?? "none"} (${source === "profile" ? "from profile" : "default"})`,
-        `  compat:        ${JSON.stringify(effective.compat) ?? "none"} (${source === "profile" ? "from profile" : "default"})`,
-        `  cost:          ${JSON.stringify(effective.cost) ?? "none"}`,
-        `  source:        ${source}`,
-        `  profilesFile:  ${PROFILES_PATH}`,
-        "",
-        `Profile snippet (paste into ${PROFILES_PATH}):`,
-        `  "${model.id}": {`,
-        `    "name": "${effective.name}",`,
-        `    "reasoning": ${effective.reasoning},`,
-        ...(effective.thinkingLevelMap ? [`    "thinkingLevelMap": ${JSON.stringify(effective.thinkingLevelMap)},`] : []),
-        ...(effective.input && effective.input.length > 0 ? [`    "input": ${JSON.stringify(effective.input)},`] : []),
-        `    "contextWindow": ${effective.contextWindow},`,
-        `    "maxTokens": ${effective.maxTokens}`,
-        `  }`,
+        "===== CURRENT MODEL INFO =====",
+        `Model: ${model.name ?? model.id} (${model.provider})`,
+        `  id:               ${model.id}`,
+        ...(full ? [`  api:              ${model.api}`] : []),
+        ...(full ? [`  baseUrl:          ${model.baseUrl}`] : []),
+        `  contextWindow:    ${model.contextWindow}`,
+        `  maxTokens:        ${model.maxTokens}`,
+        `  input:            ${formatInputSummary(model.input, model.reasoning ?? false, ctx.thinkingLevel)}`,
+        ...(full ? [`  thinkingLevelMap: ${JSON.stringify(model.thinkingLevelMap) ?? "none"}`] : []),
+        ...(full ? [`  compat:           ${JSON.stringify(model.compat) ?? "none"}`] : []),
+        ...(full || hasNonzeroCost(model.cost) ? formatCostLines(model.cost, { full }) : []),
+        ...(model.provider === "lmstudio" ? [`  source:           ${metadataSource}`] : []),
+        ...(full && model.provider === "lmstudio" ? [`  profilesFile:     ${PROFILES_PATH}`] : []),
       ];
 
-      ctx.ui.setWidget("lmstudio-info", lines);
+      ctx.ui.setWidget("model-info", lines);
       infoVisible = true;
-      ctx.ui.notify("Model info displayed above editor", "info");
     },
   });
 
