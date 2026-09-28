@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
@@ -168,25 +168,10 @@ function formatName(id: string): string {
 
 // ── Profile loading ─────────────────────────────────────────────────────────
 
-function normalizeProfiles(parsed: unknown): EndpointProfiles {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-  const object = parsed as Record<string, unknown>;
-
-  // Backward compatibility: the original format was model -> profile and
-  // implicitly referred to the local endpoint.
-  const values = Object.values(object);
-  const isLegacy = values.some(
-    (value) => value && typeof value === "object" && !Array.isArray(value) &&
-      ("name" in value || "reasoning" in value || "thinkingLevelMap" in value || "input" in value || "contextWindow" in value || "maxTokens" in value || "cost" in value || "compat" in value),
-  );
-  return isLegacy
-    ? { [DEFAULT_LOCAL_ENDPOINT_ID]: object as Record<string, ModelProfile> }
-    : object as EndpointProfiles;
-}
-
 async function loadProfiles(): Promise<EndpointProfiles> {
   try {
-    return normalizeProfiles(JSON.parse(await readFile(PROFILES_PATH, "utf8")));
+    const parsed = JSON.parse(await readFile(PROFILES_PATH, "utf8")) as EndpointProfiles;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
     // File doesn't exist yet or is invalid — return empty
     return {};
@@ -235,6 +220,34 @@ function isLmStudioProvider(provider?: string): boolean {
   return provider === "lmstudio" || provider?.endsWith("/lmstudio") === true;
 }
 
+interface EndpointDiscovery {
+  available: boolean;
+  models: ProviderModelConfig[];
+  status?: number;
+}
+
+async function discoverEndpoint(
+  baseUrl: string,
+  profiles: Record<string, ModelProfile>,
+  signal?: AbortSignal,
+): Promise<EndpointDiscovery> {
+  const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
+  const requestSignal = AbortSignal.any(signal ? [signal, timeout] : [timeout]);
+  try {
+    const response = await fetch(`${baseUrl}/models`, { signal: requestSignal });
+    if (!response.ok) return { available: false, models: [], status: response.status };
+    const payload = (await response.json()) as { data?: Array<{ id?: string }> };
+    if (!Array.isArray(payload.data)) return { available: false, models: [] };
+    const models = payload.data
+      .filter((model): model is { id: string } => typeof model.id === "string")
+      .filter((model) => !isEmbeddingModel(model.id))
+      .map((model) => buildModel(model.id, profiles).model);
+    return { available: true, models };
+  } catch {
+    return { available: false, models: [] };
+  }
+}
+
 // Build a complete model definition by merging defaults with profile overrides
 function buildModel(
   id: string,
@@ -278,11 +291,11 @@ function buildModel(
 
 // Build a starter profile from the default guesses, used to prefill the
 // editor when prompting to add a profile for a model that doesn't have one
-function makeDraftProfile(id: string): ModelProfile {
+function makeDraftProfile(id: string, supportsImages: boolean): ModelProfile {
   return {
     name: formatName(id),
     reasoning: guessReasoning(id),
-    input: ["text"],
+    input: supportsImages ? ["text", "image"] : ["text"],
     contextWindow: guessContextWindow(id),
     maxTokens: guessMaxTokens(id),
   };
@@ -507,6 +520,11 @@ export default async function (pi: ExtensionAPI) {
       return;
     }
 
+    const supportsImages = await ctx.ui.confirm(
+      `Vision capability for ${model.id}`,
+      "Does this model accept image input? Choose No if unsure; you can edit the profile later.",
+    );
+
     // Load existing profiles, or start empty if the file doesn't exist yet.
     let profilesJson: EndpointProfiles = {};
     let raw: string | undefined;
@@ -517,7 +535,7 @@ export default async function (pi: ExtensionAPI) {
     }
     if (raw !== undefined) {
       try {
-        profilesJson = normalizeProfiles(JSON.parse(raw));
+        profilesJson = JSON.parse(raw) as EndpointProfiles;
       } catch (err) {
         // Don't silently overwrite a broken file
         ctx.ui.notify(
@@ -530,7 +548,7 @@ export default async function (pi: ExtensionAPI) {
 
     // Prefill the editor with the current file plus a draft entry
     if (!profilesJson[endpointId]) profilesJson[endpointId] = {};
-    profilesJson[endpointId][model.id] = makeDraftProfile(model.id);
+    profilesJson[endpointId][model.id] = makeDraftProfile(model.id, supportsImages);
     const edited = await ctx.ui.editor(
       `Add profile for ${model.id}`,
       JSON.stringify(profilesJson, null, 2) + "\n",
@@ -552,76 +570,98 @@ export default async function (pi: ExtensionAPI) {
     }
 
     await writeFile(PROFILES_PATH, edited);
-    ctx.ui.notify("Profile saved — reloading to apply", "info");
-
-    // ctx.reload() may only be called from command handlers (it can deadlock
-    // from event handlers), so queue it as a follow-up command instead.
-    pi.sendUserMessage("/lmstudio-reload", { deliverAs: "followUp" });
+    const result = await applyProfileChanges(model, ctx.modelRegistry, ctx.signal);
+    ctx.ui.notify(result, "info");
   });
 
-  const profiles = await loadProfiles();
-  for (const [endpointId, endpoint] of Object.entries(endpoints)) {
-    const providerName = endpointProviderId(endpointId);
+  const registerEndpointProvider = (
+    endpointId: string,
+    endpoint: LmStudioEndpoint,
+    models?: ProviderModelConfig[],
+  ) => {
     const baseUrl = endpointBaseUrl(endpoint);
-    pi.registerProvider(providerName, {
+    const config = {
       baseUrl,
       apiKey: "lmstudio",
-      api: "openai-completions",
-      // @ts-expect-error Pi accepts provider-level compat at runtime, but the current ProviderConfig type does not expose it.
+      api: "openai-completions" as const,
       compat: {
         supportsDeveloperRole: false,
         supportsReasoningEffort: false,
       },
-      async refreshModels({ signal }) {
-        const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
-        const combinedSignal = AbortSignal.any(signal ? [signal, timeout] : [timeout]);
-        try {
-          const response = await fetch(`${baseUrl}/models`, { signal: combinedSignal });
-          if (!response.ok) return [];
+      ...(models
+        ? { models }
+        : {
+            async refreshModels({ signal }: { signal?: AbortSignal }) {
+              const profiles = await loadProfiles();
+              const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
+              return discovery.models;
+            },
+          }),
+    };
+    pi.registerProvider(endpointProviderId(endpointId), config);
+  };
 
-          const payload = (await response.json()) as {
-            data: Array<{ id: string; object?: string; owned_by?: string }>;
-          };
-
-          return payload.data
-            .filter((m) => !isEmbeddingModel(m.id))
-            .map((m) => buildModel(m.id, profiles[endpointId] ?? {}).model);
-        } catch {
-          return [];
-        }
-      },
-    });
+  for (const [endpointId, endpoint] of Object.entries(endpoints)) {
+    registerEndpointProvider(endpointId, endpoint);
   }
+
+  const refreshEndpoints = async (signal?: AbortSignal) => {
+    const profiles = await loadProfiles();
+    return Promise.all(Object.entries(endpoints).map(async ([endpointId, endpoint]) => {
+      const discovery = await discoverEndpoint(
+        endpointBaseUrl(endpoint),
+        profiles[endpointId] ?? {},
+        signal,
+      );
+      // Re-registration with an explicit model catalog immediately updates
+      // Pi's model registry for selection by this command and future commands.
+      registerEndpointProvider(endpointId, endpoint, discovery.models);
+      return { endpointId, endpoint, discovery };
+    }));
+  };
+
+  const applyProfileChanges = async (
+    selectedModel: { provider?: string; id: string } | undefined,
+    registry: ExtensionContext["modelRegistry"],
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    await refreshEndpoints(signal);
+    const provider = selectedModel?.provider;
+    if (!selectedModel || !provider || !isLmStudioProvider(provider)) {
+      return "LM Studio profiles and model catalogs refreshed";
+    }
+
+    const updatedModel = registry.find(provider, selectedModel.id);
+    if (!updatedModel) {
+      return `Profile saved, but ${selectedModel.id} is currently unavailable at its endpoint`;
+    }
+    const selected = await pi.setModel(updatedModel);
+    return selected
+      ? `Profile saved and applied to ${selectedModel.id}`
+      : `Profile saved, but Pi could not reselect ${selectedModel.id}`;
+  };
 
   // ── /sync-models ────────────────────────────────────────────────────────
 
   pi.registerCommand("sync-models", {
     description: "Refresh model lists from all LM Studio endpoints",
     handler: async (_args, ctx) => {
+      const results = await refreshEndpoints(ctx.signal);
       const profiles = await loadProfiles();
-      const results = await Promise.all(Object.entries(endpoints).map(async ([endpointId, endpoint]) => {
-        const baseUrl = endpointBaseUrl(endpoint);
-        const label = endpoint.name ?? endpointId;
-        try {
-          const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
-          const signal = AbortSignal.any(ctx.signal ? [ctx.signal, timeout] : [timeout]);
-          const response = await fetch(`${baseUrl}/models`, { signal });
-          if (!response.ok) return `${label}: unavailable (${response.status})`;
-
-          const payload = (await response.json()) as { data: Array<{ id: string }> };
-          const chatModels = payload.data.filter((m) => !isEmbeddingModel(m.id));
-          const endpointProfiles = profiles[endpointId] ?? {};
-          const profiled = chatModels.filter((m) => buildModel(m.id, endpointProfiles).source === "profile").length;
-          return `${label}: ${chatModels.length} models (${profiled} profiled, ${chatModels.length - profiled} defaults)`;
-        } catch {
-          return `${label}: unavailable`;
-        }
-      }));
-
       const lines = [
         "LM Studio Sync Results",
         "",
-        ...results,
+        ...results.map(({ endpointId, endpoint, discovery }) => {
+          const label = endpoint.name ?? endpointId;
+          if (!discovery.available) {
+            return `${label}: unavailable${discovery.status ? ` (${discovery.status})` : ""}`;
+          }
+          const endpointProfiles = profiles[endpointId] ?? {};
+          const profiled = discovery.models.filter((model) =>
+            buildModel(model.id, endpointProfiles).source === "profile"
+          ).length;
+          return `${label}: ${discovery.models.length} models (${profiled} profiled, ${discovery.models.length - profiled} defaults)`;
+        }),
       ];
       await ctx.ui.custom<void>(
         (tui, theme, _keybindings, done) => new SyncResultOverlay(tui, theme, lines, done),
@@ -635,9 +675,95 @@ export default async function (pi: ExtensionAPI) {
           },
         },
       );
-      // Re-register providers so the live model catalogs reflect this sync.
-      // This is the final operation because reload invalidates ctx.
-      await ctx.reload();
+    },
+  });
+
+  // ── /set-model-from-provider ───────────────────────────────────────────
+
+  pi.registerCommand("set-model-from-provider", {
+    description: "Choose a model by provider",
+    handler: async (_args, ctx) => {
+      const endpointResults = await refreshEndpoints(ctx.signal);
+      const endpointIds = new Set(Object.keys(endpoints).map(endpointProviderId));
+      const endpointStatus = new Map(endpointResults.map(({ endpointId, discovery }) => [
+        endpointProviderId(endpointId), discovery,
+      ]));
+
+      while (true) {
+        const models = ctx.modelRegistry.getAll();
+        const entries: Array<{ label: string; provider: string; offline?: boolean }> = [];
+        for (const [endpointId, endpoint] of Object.entries(endpoints)) {
+          const provider = endpointProviderId(endpointId);
+          const discovery = endpointStatus.get(provider);
+          const name = endpoint.name ?? endpointId;
+          entries.push({
+            label: discovery?.available
+              ? `${name} — ${discovery.models.length} models`
+              : `${name} — offline`,
+            provider,
+            offline: !discovery?.available,
+          });
+        }
+
+        const byProvider = new Map<string, typeof models>();
+        for (const model of models) {
+          if (endpointIds.has(model.provider) || isLmStudioProvider(model.provider)) continue;
+          const group = byProvider.get(model.provider) ?? [];
+          group.push(model);
+          byProvider.set(model.provider, group);
+        }
+        for (const [provider, providerModels] of byProvider) {
+          if (providerModels.length === 0) continue;
+          if (!ctx.modelRegistry.getProviderAuthStatus(provider).configured) continue;
+          const name = ctx.modelRegistry.getProviderDisplayName(provider);
+          entries.push({
+            label: `${name} — ${providerModels.length} models`,
+            provider,
+          });
+        }
+
+        entries.sort((a, b) => a.label.localeCompare(b.label));
+        const usedLabels = new Set<string>();
+        for (const entry of entries) {
+          const baseLabel = entry.label;
+          if (usedLabels.has(entry.label)) {
+            entry.label = `${baseLabel} (${entry.provider})`;
+            let duplicate = 2;
+            while (usedLabels.has(entry.label)) {
+              entry.label = `${baseLabel} (${entry.provider} ${duplicate++})`;
+            }
+          }
+          usedLabels.add(entry.label);
+        }
+        const selectedLabel = await ctx.ui.select(
+          "Choose a provider",
+          entries.map((entry) => entry.label),
+        );
+        if (selectedLabel === undefined) return;
+        const selected = entries.find((entry) => entry.label === selectedLabel);
+        if (!selected) return;
+        if (selected.offline) continue;
+
+        const providerModels = ctx.modelRegistry.getAll()
+          .filter((model) => model.provider === selected.provider)
+          .sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id));
+        if (providerModels.length === 0) continue;
+
+        const modelLabels = providerModels.map((model) => `${model.name ?? model.id} (${model.id})`);
+        const selectedModelLabel = await ctx.ui.select(
+          `Choose a model — ${selected.label.split(" — ")[0]}`,
+          modelLabels,
+        );
+        if (selectedModelLabel === undefined) continue;
+        const model = providerModels[modelLabels.indexOf(selectedModelLabel)];
+        if (!model) continue;
+
+        const success = await pi.setModel(model);
+        if (!success) {
+          ctx.ui.notify(`Could not select ${model.id}; check authentication for ${selected.provider}.`, "warning");
+        }
+        return;
+      }
     },
   });
 
@@ -820,9 +946,10 @@ export default async function (pi: ExtensionAPI) {
   // ── /lmstudio-reload ────────────────────────────────────────────────────
 
   pi.registerCommand("lmstudio-reload", {
-    description: "Reload pi to apply LM Studio profile changes",
+    description: "Refresh LM Studio profiles and model catalogs",
     handler: async (_args, ctx) => {
-      await ctx.reload();
+      const result = await applyProfileChanges(ctx.model, ctx.modelRegistry, ctx.signal);
+      ctx.ui.notify(result, "info");
     },
   });
 }

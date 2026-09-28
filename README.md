@@ -59,11 +59,12 @@ The extension registers one provider per configured endpoint and discovers chat 
 Commands:
 
 - `/sync-models` — refresh model lists from all LM Studio endpoints
+- `/set-model-from-provider` — choose a configured LM Studio endpoint or an authenticated provider, then choose a model
 - `/lmstudio-endpoints` — edit LM Studio endpoint configuration
 - `/model-info` — toggle the current model's brief settings widget
 - `/model-info-full` — show the current model's full settings in a scrollable overlay
 - `/lmstudio-profiles` — edit LM Studio model profiles
-- `/lmstudio-reload` — reload Pi to apply profile changes
+- `/lmstudio-reload` — refresh LM Studio profiles and model catalogs
 
 Profiles are stored in:
 
@@ -83,7 +84,7 @@ New profiles are scoped by endpoint:
 }
 ```
 
-For backward compatibility, the original flat profile format is interpreted as belonging to the `local` endpoint. When selecting an LM Studio model without a profile, the extension can prompt you to add one.
+Profiles must be scoped by endpoint. When selecting an LM Studio model without a profile, the extension can prompt you to add one.
 
 ## Development
 
