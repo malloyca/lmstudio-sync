@@ -291,11 +291,11 @@ function buildModel(
 
 // Build a starter profile from the default guesses, used to prefill the
 // editor when prompting to add a profile for a model that doesn't have one
-function makeDraftProfile(id: string): ModelProfile {
+function makeDraftProfile(id: string, supportsImages: boolean): ModelProfile {
   return {
     name: formatName(id),
     reasoning: guessReasoning(id),
-    input: ["text"],
+    input: supportsImages ? ["text", "image"] : ["text"],
     contextWindow: guessContextWindow(id),
     maxTokens: guessMaxTokens(id),
   };
@@ -520,6 +520,11 @@ export default async function (pi: ExtensionAPI) {
       return;
     }
 
+    const supportsImages = await ctx.ui.confirm(
+      `Vision capability for ${model.id}`,
+      "Does this model accept image input? Choose No if unsure; you can edit the profile later.",
+    );
+
     // Load existing profiles, or start empty if the file doesn't exist yet.
     let profilesJson: EndpointProfiles = {};
     let raw: string | undefined;
@@ -543,7 +548,7 @@ export default async function (pi: ExtensionAPI) {
 
     // Prefill the editor with the current file plus a draft entry
     if (!profilesJson[endpointId]) profilesJson[endpointId] = {};
-    profilesJson[endpointId][model.id] = makeDraftProfile(model.id);
+    profilesJson[endpointId][model.id] = makeDraftProfile(model.id, supportsImages);
     const edited = await ctx.ui.editor(
       `Add profile for ${model.id}`,
       JSON.stringify(profilesJson, null, 2) + "\n",
