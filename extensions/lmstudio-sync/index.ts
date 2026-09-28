@@ -4,6 +4,11 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
+import { endpointBaseUrl, endpointIdFromProvider, endpointProviderId, validateEndpointConfig } from "./config.ts";
+import type { EndpointConfig, LmStudioEndpoint } from "./config.ts";
+import { ensureRuntimeContext, readActiveRuntimeContext } from "./runtime.ts";
+import { buildModel, discoverEndpoint, guessedModelProfile, validateProfileConfig } from "./catalog.ts";
+import type { ModelProfile } from "./catalog.ts";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -12,54 +17,12 @@ const PROFILES_PATH = join(CONFIG_DIR, "lmstudio-profiles.json");
 const ENDPOINTS_PATH = join(CONFIG_DIR, "lmstudio-endpoints.json");
 const DEFAULT_LOCAL_ENDPOINT_ID = "local";
 const DEFAULT_LOCAL_PORT = "1234";
-const ENDPOINT_TIMEOUT_MS = 5_000;
-const MODEL_LOAD_TIMEOUT_MS = 180_000;
-const MODEL_UNLOAD_TIMEOUT_MS = 60_000;
-
-// Models whose names suggest they're embeddings, not chat models
-const EMBEDDING_PATTERNS = [
-  "embedding",
-  "embed",
-  "-embed-",
-  "text-embedding",
-  "nomic-embed",
-  "gte-",
-  "e5-",
-];
 
 // ── Profile types ───────────────────────────────────────────────────────────
 
-interface LmStudioEndpoint {
-  name?: string;
-  baseUrl: string;
-  enabled?: boolean;
-}
-
-type EndpointConfig = Record<string, LmStudioEndpoint>;
 type EndpointProfiles = Record<string, Record<string, ModelProfile>>;
 
-interface ModelProfile {
-  name?: string;
-  reasoning?: boolean;
-  thinkingLevelMap?: Record<string, string | null>;
-  input?: ("text" | "image")[];
-  contextWindow?: number;
-  maxTokens?: number;
-  cost?: {
-    input?: number;
-    output?: number;
-    cacheRead?: number;
-    cacheWrite?: number;
-  };
-  compat?: Record<string, unknown>;
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-function isEmbeddingModel(id: string): boolean {
-  const lower = id.toLowerCase();
-  return EMBEDDING_PATTERNS.some((p) => lower.includes(p));
-}
 
 function hasNonzeroCost(cost: ProviderModelConfig["cost"]): boolean {
   return (
@@ -123,58 +86,11 @@ function formatInputSummary(
   return `${inputText} (reasoning${thinkingLevel ? `: ${thinkingLevel}` : ""})`;
 }
 
-// Heuristic: guess if a model supports reasoning based on common naming patterns
-function guessReasoning(id: string): boolean {
-  const lower = id.toLowerCase();
-  return (
-    lower.includes("r1") ||
-    lower.includes("deepseek-r") ||
-    lower.includes("reason") ||
-    lower.includes("-r1-")
-  );
-}
-
-// Extract the parameter count (in billions) from a model id, if present.
-// Names that include the size consistently format it as "<num>b" with no
-// space between the number and the 'b' (e.g. "qwen/qwen3.6-27b" -> 27)
-function getParameterCount(id: string): number | null {
-  const matches = [...id.toLowerCase().matchAll(/(\d+(?:\.\d+)?)b/g)];
-  if (matches.length === 0) return null;
-  const value = Number(matches[matches.length - 1][1]);
-  return Number.isFinite(value) ? value : null;
-}
-
-// Guess context window from parameter count (in billions)
-function guessContextWindow(id: string): number {
-  const params = getParameterCount(id);
-  if (params === null) return 128_000;
-  if (params < 5) return 32_000;
-  if (params < 20) return 64_000;
-  return 128_000;
-}
-
-// Guess max output tokens from parameter count (in billions)
-function guessMaxTokens(id: string): number {
-  const params = getParameterCount(id);
-  if (params === null) return 48_000;
-  if (params < 5) return 16_000;
-  if (params < 20) return 32_000;
-  return 48_000;
-}
-
-// Format name for display, e.g. "qwen/qwen3.6-27b" -> "Qwen 3.6 27B"
-function formatName(id: string): string {
-  const parts = id.split("/");
-  const name = parts[parts.length - 1];
-  return name.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
 // ── Profile loading ─────────────────────────────────────────────────────────
 
 async function loadProfiles(): Promise<EndpointProfiles> {
   try {
-    const parsed = JSON.parse(await readFile(PROFILES_PATH, "utf8")) as EndpointProfiles;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    return validateProfileConfig(JSON.parse(await readFile(PROFILES_PATH, "utf8")) as unknown);
   } catch {
     // File doesn't exist yet or is invalid — return empty
     return {};
@@ -184,20 +100,7 @@ async function loadProfiles(): Promise<EndpointProfiles> {
 async function loadEndpoints(): Promise<EndpointConfig> {
   try {
     const raw = await readFile(ENDPOINTS_PATH, "utf8");
-    const parsed = JSON.parse(raw) as EndpointConfig;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).length === 0) {
-      throw new Error("expected a non-empty object of endpoint definitions");
-    }
-    for (const [id, endpoint] of Object.entries(parsed)) {
-      if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`invalid endpoint ID: ${id}`);
-      if (!endpoint || typeof endpoint !== "object" || typeof endpoint.baseUrl !== "string") {
-        throw new Error(`endpoint ${id} must define a baseUrl`);
-      }
-      if (endpoint.enabled !== undefined && typeof endpoint.enabled !== "boolean") {
-        throw new Error(`endpoint ${id} enabled must be a boolean`);
-      }
-    }
-    return parsed;
+    return validateEndpointConfig(JSON.parse(raw) as unknown);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     // Create the default configuration below when the file is missing.
@@ -214,226 +117,14 @@ async function loadEndpoints(): Promise<EndpointConfig> {
   return endpoints;
 }
 
-function endpointProviderId(endpointId: string): string {
-  return `${endpointId}/lmstudio`;
-}
-
-function endpointBaseUrl(endpoint: LmStudioEndpoint): string {
-  return endpoint.baseUrl.replace(/\/$/, "");
-}
-
 function isLmStudioProvider(provider?: string): boolean {
   return provider === "lmstudio" || provider?.endsWith("/lmstudio") === true;
-}
-
-interface EndpointDiscovery {
-  available: boolean;
-  disabled?: boolean;
-  models: ProviderModelConfig[];
-  status?: number;
-}
-
-interface LoadedModelInstance {
-  id: string;
-  config: Record<string, unknown>;
-}
-
-interface NativeModelInfo {
-  key: string;
-  maxContextLength: number;
-  loadedInstances: LoadedModelInstance[];
-}
-
-function nativeApiRoot(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
-}
-
-async function readNativeModelInfo(baseUrl: string, modelId: string): Promise<NativeModelInfo> {
-  const response = await fetch(`${nativeApiRoot(baseUrl)}/api/v1/models`, {
-    signal: AbortSignal.timeout(ENDPOINT_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`LM Studio model query failed (HTTP ${response.status})`);
-
-  const payload = await response.json() as { models?: unknown };
-  if (!Array.isArray(payload.models)) throw new Error("LM Studio returned an invalid model list");
-  const item = payload.models.find((model) =>
-    model && typeof model === "object" && (model as { key?: unknown }).key === modelId,
-  ) as {
-    key?: unknown;
-    max_context_length?: unknown;
-    loaded_instances?: unknown;
-  } | undefined;
-  if (!item) throw new Error(`LM Studio did not report model ${modelId}`);
-  if (typeof item.key !== "string" || !Number.isSafeInteger(item.max_context_length) ||
-      (item.max_context_length as number) <= 0 || !Array.isArray(item.loaded_instances)) {
-    throw new Error(`LM Studio returned incomplete runtime metadata for ${modelId}`);
-  }
-
-  const loadedInstances: LoadedModelInstance[] = [];
-  for (const instance of item.loaded_instances) {
-    if (!instance || typeof instance !== "object") {
-      throw new Error(`LM Studio returned an invalid loaded instance for ${modelId}`);
-    }
-    const candidate = instance as { id?: unknown; config?: unknown };
-    if (typeof candidate.id !== "string" || !candidate.config || typeof candidate.config !== "object") {
-      throw new Error(`LM Studio returned incomplete loaded-instance data for ${modelId}`);
-    }
-    loadedInstances.push({ id: candidate.id, config: candidate.config as Record<string, unknown> });
-  }
-
-  return {
-    key: item.key,
-    maxContextLength: item.max_context_length as number,
-    loadedInstances,
-  };
-}
-
-async function readActiveRuntimeContext(baseUrl: string, modelId: string): Promise<number | undefined> {
-  try {
-    const info = await readNativeModelInfo(baseUrl, modelId);
-    if (info.loadedInstances.length !== 1 || info.loadedInstances[0].id !== info.key) return undefined;
-    const contextLength = info.loadedInstances[0].config.context_length;
-    return Number.isSafeInteger(contextLength) && (contextLength as number) > 0
-      ? contextLength as number
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-interface LoadModelOptions {
-  eval_batch_size?: number;
-  flash_attention?: boolean;
-  num_experts?: number;
-  offload_kv_cache_to_gpu?: boolean;
-}
-
-function preservedLoadOptions(config: Record<string, unknown>): LoadModelOptions {
-  const options: LoadModelOptions = {};
-  if (typeof config.eval_batch_size === "number") options.eval_batch_size = config.eval_batch_size;
-  if (typeof config.flash_attention === "boolean") options.flash_attention = config.flash_attention;
-  if (typeof config.num_experts === "number") options.num_experts = config.num_experts;
-  if (typeof config.offload_kv_cache_to_gpu === "boolean") {
-    options.offload_kv_cache_to_gpu = config.offload_kv_cache_to_gpu;
-  }
-  return options;
-}
-
-async function unloadModelInstance(baseUrl: string, instanceId: string): Promise<void> {
-  const response = await fetch(`${nativeApiRoot(baseUrl)}/api/v1/models/unload`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ instance_id: instanceId }),
-    signal: AbortSignal.timeout(MODEL_UNLOAD_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`LM Studio unload failed (HTTP ${response.status})`);
-  const payload = await response.json() as { instance_id?: unknown };
-  if (payload.instance_id !== instanceId) throw new Error("LM Studio did not confirm the requested instance unload");
-}
-
-async function loadModelInstance(
-  baseUrl: string,
-  modelId: string,
-  contextLength: number,
-  options: LoadModelOptions = {},
-): Promise<string> {
-  const response = await fetch(`${nativeApiRoot(baseUrl)}/api/v1/models/load`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: modelId,
-      context_length: contextLength,
-      echo_load_config: true,
-      ...options,
-    }),
-    signal: AbortSignal.timeout(MODEL_LOAD_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`LM Studio load failed (HTTP ${response.status})`);
-  const payload = await response.json() as {
-    status?: unknown;
-    instance_id?: unknown;
-    load_config?: { context_length?: unknown };
-  };
-  if (payload.status !== "loaded" || typeof payload.instance_id !== "string" ||
-      payload.load_config?.context_length !== contextLength) {
-    throw new Error("LM Studio did not confirm the requested context length");
-  }
-  return payload.instance_id;
-}
-
-async function discoverEndpoint(
-  baseUrl: string,
-  profiles: Record<string, ModelProfile>,
-  signal?: AbortSignal,
-): Promise<EndpointDiscovery> {
-  const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
-  const requestSignal = AbortSignal.any(signal ? [signal, timeout] : [timeout]);
-  try {
-    const response = await fetch(`${baseUrl}/models`, { signal: requestSignal });
-    if (!response.ok) return { available: false, models: [], status: response.status };
-    const payload = (await response.json()) as { data?: Array<{ id?: string }> };
-    if (!Array.isArray(payload.data)) return { available: false, models: [] };
-    const models = payload.data
-      .filter((model): model is { id: string } => typeof model.id === "string")
-      .filter((model) => !isEmbeddingModel(model.id))
-      .map((model) => buildModel(model.id, profiles).model);
-    return { available: true, models };
-  } catch {
-    return { available: false, models: [] };
-  }
-}
-
-// Build a complete model definition by merging defaults with profile overrides
-function buildModel(
-  id: string,
-  profiles: Record<string, ModelProfile>,
-): { model: ProviderModelConfig; source: "profile" | "default" } {
-  // Start with sensible defaults
-  const defaults: ProviderModelConfig = {
-    id,
-    name: formatName(id),
-    reasoning: guessReasoning(id),
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: guessContextWindow(id),
-    maxTokens: guessMaxTokens(id),
-  };
-
-  // Look up profile (exact match on id)
-  const profile = profiles[id];
-  if (!profile) {
-    return { model: defaults, source: "default" };
-  }
-
-  // Merge profile over defaults (partial overrides)
-  const model: ProviderModelConfig = { ...defaults };
-
-  if (profile.name !== undefined) model.name = profile.name;
-  if (profile.reasoning !== undefined) model.reasoning = profile.reasoning;
-  if (profile.thinkingLevelMap !== undefined) model.thinkingLevelMap = profile.thinkingLevelMap;
-  if (profile.input !== undefined) model.input = profile.input;
-  if (profile.contextWindow !== undefined) model.contextWindow = profile.contextWindow;
-  if (profile.maxTokens !== undefined) model.maxTokens = profile.maxTokens;
-  if (profile.compat !== undefined) model.compat = profile.compat;
-
-  // Merge cost (partial overrides)
-  if (profile.cost) {
-    model.cost = { ...defaults.cost, ...profile.cost };
-  }
-
-  return { model, source: "profile" };
 }
 
 // Build a starter profile from the default guesses, used to prefill the
 // editor when prompting to add a profile for a model that doesn't have one
 function makeDraftProfile(id: string, supportsImages: boolean): ModelProfile {
-  return {
-    name: formatName(id),
-    reasoning: guessReasoning(id),
-    input: supportsImages ? ["text", "image"] : ["text"],
-    contextWindow: guessContextWindow(id),
-    maxTokens: guessMaxTokens(id),
-  };
+  return guessedModelProfile(id, supportsImages);
 }
 
 function formatJsonValue(value: unknown): string {
@@ -633,130 +324,25 @@ export default async function (pi: ExtensionAPI) {
   const ensureProfileRuntimeContext = async (
     model: { provider?: string; id: string },
   ): Promise<{ level: "info" | "warning"; message: string } | undefined> => {
-    if (!isLmStudioProvider(model.provider)) return undefined;
-    const endpointId = model.provider?.endsWith("/lmstudio")
-      ? model.provider.slice(0, -"/lmstudio".length)
-      : DEFAULT_LOCAL_ENDPOINT_ID;
+    const endpointId = endpointIdFromProvider(model.provider, DEFAULT_LOCAL_ENDPOINT_ID);
+    if (!endpointId) return undefined;
     const endpoint = endpoints[endpointId];
     if (!endpoint || endpoint.enabled === false) return undefined;
 
     const profiles = await loadProfiles();
     const requestedContext = profiles[endpointId]?.[model.id]?.contextWindow;
     if (requestedContext === undefined) return undefined;
-    if (!Number.isSafeInteger(requestedContext) || requestedContext <= 0) {
-      return { level: "warning", message: `Invalid contextWindow profile value for ${model.id}; LM Studio was not changed.` };
-    }
 
     const operationKey = `${endpointId}:${model.id}`;
     const pending = runtimeAdjustments.get(operationKey);
     if (pending) return pending;
 
-    const operation = (async (): Promise<{ level: "info" | "warning"; message: string } | undefined> => {
-      const baseUrl = endpointBaseUrl(endpoint);
-      let info: NativeModelInfo;
-      try {
-        info = await readNativeModelInfo(baseUrl, model.id);
-      } catch (err) {
-        return {
-          level: "warning",
-          message: `Could not verify LM Studio runtime for ${model.id}: ${err instanceof Error ? err.message : String(err)}. No load changes were made.`,
-        };
-      }
-
-      if (requestedContext > info.maxContextLength) {
-        return {
-          level: "warning",
-          message: `Profile requests ${requestedContext} context for ${model.id}, above LM Studio's maximum of ${info.maxContextLength}; no load changes were made.`,
-        };
-      }
-      if (info.loadedInstances.length > 1) {
-        return {
-          level: "warning",
-          message: `LM Studio has multiple loaded instances of ${model.id}; automatic context adjustment was skipped to avoid changing the wrong instance.`,
-        };
-      }
-
-      const current = info.loadedInstances[0];
-      const currentContext = current?.config.context_length;
-      if (current && (current.id !== info.key || !Number.isSafeInteger(currentContext) || (currentContext as number) <= 0)) {
-        return {
-          level: "warning",
-          message: `LM Studio's loaded instance for ${model.id} has an unexpected ID or context configuration; automatic adjustment was skipped.`,
-        };
-      }
-      if (current && (currentContext as number) >= requestedContext) return undefined;
-
-      const priorContext = currentContext as number | undefined;
-      const priorLoadOptions = current ? preservedLoadOptions(current.config) : {};
-      let unloadAttempted = false;
-      try {
-        if (current) {
-          unloadAttempted = true;
-          await unloadModelInstance(baseUrl, current.id);
-          const afterUnload = await readNativeModelInfo(baseUrl, model.id);
-          if (afterUnload.loadedInstances.length !== 0) {
-            throw new Error("the previous model instance is still reported as loaded after unload");
-          }
-        }
-
-        const loadedId = await loadModelInstance(baseUrl, model.id, requestedContext, priorLoadOptions);
-        if (loadedId !== info.key) {
-          throw new Error(`LM Studio loaded instance ${loadedId} instead of the canonical model ID ${info.key}`);
-        }
-        const afterLoad = await readNativeModelInfo(baseUrl, model.id);
-        if (afterLoad.loadedInstances.length !== 1 ||
-            afterLoad.loadedInstances[0].id !== info.key ||
-            afterLoad.loadedInstances[0].config.context_length !== requestedContext) {
-          throw new Error("the loaded instance list did not confirm exactly one instance at the requested context");
-        }
-
-        return {
-          level: "info",
-          message: `LM Studio loaded ${model.id} on ${endpoint.name ?? endpointId} with context ${requestedContext}.`,
-        };
-      } catch (err) {
-        let restoreNote = "";
-        if (current && priorContext !== undefined && unloadAttempted) {
-          try {
-            const restoreState = await readNativeModelInfo(baseUrl, model.id);
-            if (restoreState.loadedInstances.length > 1) {
-              throw new Error("multiple instances are now loaded; refusing to guess which one to unload");
-            }
-            if (restoreState.loadedInstances.length === 1) {
-              const loaded = restoreState.loadedInstances[0];
-              if (loaded.id !== info.key) throw new Error(`unexpected instance ${loaded.id} is loaded`);
-              if (loaded.config.context_length === priorContext) {
-                restoreNote = " The previous context is still active.";
-              } else {
-                await unloadModelInstance(baseUrl, loaded.id);
-                await loadModelInstance(baseUrl, model.id, priorContext, priorLoadOptions);
-                const restored = await readNativeModelInfo(baseUrl, model.id);
-                if (restored.loadedInstances.length !== 1 || restored.loadedInstances[0].id !== info.key ||
-                    restored.loadedInstances[0].config.context_length !== priorContext) {
-                  throw new Error("LM Studio did not confirm the previous context after reload");
-                }
-                restoreNote = " The previous context was restored.";
-              }
-            } else {
-              await loadModelInstance(baseUrl, model.id, priorContext, priorLoadOptions);
-              const restored = await readNativeModelInfo(baseUrl, model.id);
-              if (restored.loadedInstances.length !== 1 || restored.loadedInstances[0].id !== info.key ||
-                  restored.loadedInstances[0].config.context_length !== priorContext) {
-                throw new Error("LM Studio did not confirm the previous context after reload");
-              }
-              restoreNote = " The previous context was restored.";
-            }
-          } catch (restoreError) {
-            restoreNote = ` WARNING: restoring the previous context also failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}.`;
-          }
-        }
-        return {
-          level: "warning",
-          message: `Could not apply context ${requestedContext} to ${model.id}: ${err instanceof Error ? err.message : String(err)}.${restoreNote}`,
-        };
-      }
-    })();
-
+    const operation = ensureRuntimeContext(
+      endpointBaseUrl(endpoint),
+      model.id,
+      requestedContext,
+      endpoint.name ?? endpointId,
+    );
     runtimeAdjustments.set(operationKey, operation);
     try {
       return await operation;
@@ -796,9 +382,7 @@ export default async function (pi: ExtensionAPI) {
     if (promptedModels.has(`${model.provider}:${model.id}`)) return;
     if (!ctx.hasUI) return;
 
-    const endpointId = model.provider?.endsWith("/lmstudio")
-      ? model.provider.slice(0, -"/lmstudio".length)
-      : DEFAULT_LOCAL_ENDPOINT_ID;
+    const endpointId = endpointIdFromProvider(model.provider, DEFAULT_LOCAL_ENDPOINT_ID)!;
     const profiles = await loadProfiles();
     if (profiles[endpointId]?.[model.id]) return;
 
@@ -829,11 +413,11 @@ export default async function (pi: ExtensionAPI) {
     }
     if (raw !== undefined) {
       try {
-        profilesJson = JSON.parse(raw) as EndpointProfiles;
+        profilesJson = validateProfileConfig(JSON.parse(raw) as unknown);
       } catch (err) {
         // Don't silently overwrite a broken file
         ctx.ui.notify(
-          `Profiles file has invalid JSON — fix it first: ${err instanceof Error ? err.message : String(err)}`,
+          `Profiles file is invalid — fix it first: ${err instanceof Error ? err.message : String(err)}`,
           "error",
         );
         return;
@@ -854,10 +438,10 @@ export default async function (pi: ExtensionAPI) {
     }
 
     try {
-      JSON.parse(edited);
+      validateProfileConfig(JSON.parse(edited) as unknown);
     } catch (err) {
       ctx.ui.notify(
-        `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+        `Invalid profile config: ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
       return;
@@ -1160,9 +744,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const endpointId = model.provider?.endsWith("/lmstudio")
-        ? model.provider.slice(0, -"/lmstudio".length)
-        : DEFAULT_LOCAL_ENDPOINT_ID;
+      const endpointId = endpointIdFromProvider(model.provider, DEFAULT_LOCAL_ENDPOINT_ID)!;
       const profiles = isLmStudioProvider(model.provider) ? await loadProfiles() : undefined;
       const metadataSource =
         isLmStudioProvider(model.provider)
@@ -1199,9 +781,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const endpointId = model.provider?.endsWith("/lmstudio")
-        ? model.provider.slice(0, -"/lmstudio".length)
-        : DEFAULT_LOCAL_ENDPOINT_ID;
+      const endpointId = endpointIdFromProvider(model.provider, DEFAULT_LOCAL_ENDPOINT_ID)!;
       const profiles = isLmStudioProvider(model.provider) ? await loadProfiles() : undefined;
       const metadataSource =
         isLmStudioProvider(model.provider)
@@ -1270,12 +850,12 @@ export default async function (pi: ExtensionAPI) {
 
       if (edited !== undefined) {
         // User saved (not cancelled)
-        // Validate JSON before writing
+        // Validate JSON and profile fields before writing
         try {
-          JSON.parse(edited);
+          validateProfileConfig(JSON.parse(edited) as unknown);
         } catch (err) {
           ctx.ui.notify(
-            `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+            `Invalid profile config: ${err instanceof Error ? err.message : String(err)}`,
             "error",
           );
           return;
