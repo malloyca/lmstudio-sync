@@ -13,6 +13,8 @@ const ENDPOINTS_PATH = join(CONFIG_DIR, "lmstudio-endpoints.json");
 const DEFAULT_LOCAL_ENDPOINT_ID = "local";
 const DEFAULT_LOCAL_PORT = "1234";
 const ENDPOINT_TIMEOUT_MS = 5_000;
+const MODEL_LOAD_TIMEOUT_MS = 180_000;
+const MODEL_UNLOAD_TIMEOUT_MS = 60_000;
 
 // Models whose names suggest they're embeddings, not chat models
 const EMBEDDING_PATTERNS = [
@@ -231,6 +233,134 @@ interface EndpointDiscovery {
   status?: number;
 }
 
+interface LoadedModelInstance {
+  id: string;
+  config: Record<string, unknown>;
+}
+
+interface NativeModelInfo {
+  key: string;
+  maxContextLength: number;
+  loadedInstances: LoadedModelInstance[];
+}
+
+function nativeApiRoot(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+async function readNativeModelInfo(baseUrl: string, modelId: string): Promise<NativeModelInfo> {
+  const response = await fetch(`${nativeApiRoot(baseUrl)}/api/v1/models`, {
+    signal: AbortSignal.timeout(ENDPOINT_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`LM Studio model query failed (HTTP ${response.status})`);
+
+  const payload = await response.json() as { models?: unknown };
+  if (!Array.isArray(payload.models)) throw new Error("LM Studio returned an invalid model list");
+  const item = payload.models.find((model) =>
+    model && typeof model === "object" && (model as { key?: unknown }).key === modelId,
+  ) as {
+    key?: unknown;
+    max_context_length?: unknown;
+    loaded_instances?: unknown;
+  } | undefined;
+  if (!item) throw new Error(`LM Studio did not report model ${modelId}`);
+  if (typeof item.key !== "string" || !Number.isSafeInteger(item.max_context_length) ||
+      (item.max_context_length as number) <= 0 || !Array.isArray(item.loaded_instances)) {
+    throw new Error(`LM Studio returned incomplete runtime metadata for ${modelId}`);
+  }
+
+  const loadedInstances: LoadedModelInstance[] = [];
+  for (const instance of item.loaded_instances) {
+    if (!instance || typeof instance !== "object") {
+      throw new Error(`LM Studio returned an invalid loaded instance for ${modelId}`);
+    }
+    const candidate = instance as { id?: unknown; config?: unknown };
+    if (typeof candidate.id !== "string" || !candidate.config || typeof candidate.config !== "object") {
+      throw new Error(`LM Studio returned incomplete loaded-instance data for ${modelId}`);
+    }
+    loadedInstances.push({ id: candidate.id, config: candidate.config as Record<string, unknown> });
+  }
+
+  return {
+    key: item.key,
+    maxContextLength: item.max_context_length as number,
+    loadedInstances,
+  };
+}
+
+async function readActiveRuntimeContext(baseUrl: string, modelId: string): Promise<number | undefined> {
+  try {
+    const info = await readNativeModelInfo(baseUrl, modelId);
+    if (info.loadedInstances.length !== 1 || info.loadedInstances[0].id !== info.key) return undefined;
+    const contextLength = info.loadedInstances[0].config.context_length;
+    return Number.isSafeInteger(contextLength) && (contextLength as number) > 0
+      ? contextLength as number
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface LoadModelOptions {
+  eval_batch_size?: number;
+  flash_attention?: boolean;
+  num_experts?: number;
+  offload_kv_cache_to_gpu?: boolean;
+}
+
+function preservedLoadOptions(config: Record<string, unknown>): LoadModelOptions {
+  const options: LoadModelOptions = {};
+  if (typeof config.eval_batch_size === "number") options.eval_batch_size = config.eval_batch_size;
+  if (typeof config.flash_attention === "boolean") options.flash_attention = config.flash_attention;
+  if (typeof config.num_experts === "number") options.num_experts = config.num_experts;
+  if (typeof config.offload_kv_cache_to_gpu === "boolean") {
+    options.offload_kv_cache_to_gpu = config.offload_kv_cache_to_gpu;
+  }
+  return options;
+}
+
+async function unloadModelInstance(baseUrl: string, instanceId: string): Promise<void> {
+  const response = await fetch(`${nativeApiRoot(baseUrl)}/api/v1/models/unload`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instance_id: instanceId }),
+    signal: AbortSignal.timeout(MODEL_UNLOAD_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`LM Studio unload failed (HTTP ${response.status})`);
+  const payload = await response.json() as { instance_id?: unknown };
+  if (payload.instance_id !== instanceId) throw new Error("LM Studio did not confirm the requested instance unload");
+}
+
+async function loadModelInstance(
+  baseUrl: string,
+  modelId: string,
+  contextLength: number,
+  options: LoadModelOptions = {},
+): Promise<string> {
+  const response = await fetch(`${nativeApiRoot(baseUrl)}/api/v1/models/load`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: modelId,
+      context_length: contextLength,
+      echo_load_config: true,
+      ...options,
+    }),
+    signal: AbortSignal.timeout(MODEL_LOAD_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`LM Studio load failed (HTTP ${response.status})`);
+  const payload = await response.json() as {
+    status?: unknown;
+    instance_id?: unknown;
+    load_config?: { context_length?: unknown };
+  };
+  if (payload.status !== "loaded" || typeof payload.instance_id !== "string" ||
+      payload.load_config?.context_length !== contextLength) {
+    throw new Error("LM Studio did not confirm the requested context length");
+  }
+  return payload.instance_id;
+}
+
 async function discoverEndpoint(
   baseUrl: string,
   profiles: Record<string, ModelProfile>,
@@ -313,7 +443,13 @@ function formatJsonValue(value: unknown): string {
 
 function buildModelInfoLines(
   model: ProviderModelConfig & { provider?: string },
-  options: { full: boolean; metadataSource?: string; thinkingLevel?: string; endpointName?: string },
+  options: {
+    full: boolean;
+    metadataSource?: string;
+    thinkingLevel?: string;
+    endpointName?: string;
+    runtimeContextWindow?: number;
+  },
 ): string[] {
   if (!options.full) {
     return [
@@ -321,6 +457,9 @@ function buildModelInfoLines(
       `Model: ${model.name ?? model.id} (${model.provider ?? "unknown provider"})`,
       `  id:               ${model.id}`,
       `  contextWindow:    ${model.contextWindow}`,
+      ...(options.runtimeContextWindow !== undefined
+        ? [`  LM runtime:       ${options.runtimeContextWindow}`]
+        : []),
       `  maxTokens:        ${model.maxTokens}`,
       `  input:            ${formatInputSummary(model.input, model.reasoning ?? false, options.thinkingLevel)}`,
       ...(isLmStudioProvider(model.provider) && options.endpointName
@@ -344,6 +483,9 @@ function buildModelInfoLines(
     "",
     "Token Limits",
     `  Context window:   ${model.contextWindow}`,
+    ...(options.runtimeContextWindow !== undefined
+      ? [`  LM runtime:       ${options.runtimeContextWindow}`]
+      : []),
     `  Max output:       ${model.maxTokens}`,
     "",
     "Inputs and Reasoning",
@@ -486,6 +628,142 @@ export default async function (pi: ExtensionAPI) {
   // /new, /resume, and /reload — so the skip is per-session and the
   // prompt comes up again for a new session.
   const promptedModels = new Set<string>();
+  const runtimeAdjustments = new Map<string, Promise<{ level: "info" | "warning"; message: string } | undefined>>();
+
+  const ensureProfileRuntimeContext = async (
+    model: { provider?: string; id: string },
+  ): Promise<{ level: "info" | "warning"; message: string } | undefined> => {
+    if (!isLmStudioProvider(model.provider)) return undefined;
+    const endpointId = model.provider?.endsWith("/lmstudio")
+      ? model.provider.slice(0, -"/lmstudio".length)
+      : DEFAULT_LOCAL_ENDPOINT_ID;
+    const endpoint = endpoints[endpointId];
+    if (!endpoint || endpoint.enabled === false) return undefined;
+
+    const profiles = await loadProfiles();
+    const requestedContext = profiles[endpointId]?.[model.id]?.contextWindow;
+    if (requestedContext === undefined) return undefined;
+    if (!Number.isSafeInteger(requestedContext) || requestedContext <= 0) {
+      return { level: "warning", message: `Invalid contextWindow profile value for ${model.id}; LM Studio was not changed.` };
+    }
+
+    const operationKey = `${endpointId}:${model.id}`;
+    const pending = runtimeAdjustments.get(operationKey);
+    if (pending) return pending;
+
+    const operation = (async (): Promise<{ level: "info" | "warning"; message: string } | undefined> => {
+      const baseUrl = endpointBaseUrl(endpoint);
+      let info: NativeModelInfo;
+      try {
+        info = await readNativeModelInfo(baseUrl, model.id);
+      } catch (err) {
+        return {
+          level: "warning",
+          message: `Could not verify LM Studio runtime for ${model.id}: ${err instanceof Error ? err.message : String(err)}. No load changes were made.`,
+        };
+      }
+
+      if (requestedContext > info.maxContextLength) {
+        return {
+          level: "warning",
+          message: `Profile requests ${requestedContext} context for ${model.id}, above LM Studio's maximum of ${info.maxContextLength}; no load changes were made.`,
+        };
+      }
+      if (info.loadedInstances.length > 1) {
+        return {
+          level: "warning",
+          message: `LM Studio has multiple loaded instances of ${model.id}; automatic context adjustment was skipped to avoid changing the wrong instance.`,
+        };
+      }
+
+      const current = info.loadedInstances[0];
+      const currentContext = current?.config.context_length;
+      if (current && (current.id !== info.key || !Number.isSafeInteger(currentContext) || (currentContext as number) <= 0)) {
+        return {
+          level: "warning",
+          message: `LM Studio's loaded instance for ${model.id} has an unexpected ID or context configuration; automatic adjustment was skipped.`,
+        };
+      }
+      if (current && (currentContext as number) >= requestedContext) return undefined;
+
+      const priorContext = currentContext as number | undefined;
+      const priorLoadOptions = current ? preservedLoadOptions(current.config) : {};
+      let unloadAttempted = false;
+      try {
+        if (current) {
+          unloadAttempted = true;
+          await unloadModelInstance(baseUrl, current.id);
+          const afterUnload = await readNativeModelInfo(baseUrl, model.id);
+          if (afterUnload.loadedInstances.length !== 0) {
+            throw new Error("the previous model instance is still reported as loaded after unload");
+          }
+        }
+
+        const loadedId = await loadModelInstance(baseUrl, model.id, requestedContext, priorLoadOptions);
+        if (loadedId !== info.key) {
+          throw new Error(`LM Studio loaded instance ${loadedId} instead of the canonical model ID ${info.key}`);
+        }
+        const afterLoad = await readNativeModelInfo(baseUrl, model.id);
+        if (afterLoad.loadedInstances.length !== 1 ||
+            afterLoad.loadedInstances[0].id !== info.key ||
+            afterLoad.loadedInstances[0].config.context_length !== requestedContext) {
+          throw new Error("the loaded instance list did not confirm exactly one instance at the requested context");
+        }
+
+        return {
+          level: "info",
+          message: `LM Studio loaded ${model.id} on ${endpoint.name ?? endpointId} with context ${requestedContext}.`,
+        };
+      } catch (err) {
+        let restoreNote = "";
+        if (current && priorContext !== undefined && unloadAttempted) {
+          try {
+            const restoreState = await readNativeModelInfo(baseUrl, model.id);
+            if (restoreState.loadedInstances.length > 1) {
+              throw new Error("multiple instances are now loaded; refusing to guess which one to unload");
+            }
+            if (restoreState.loadedInstances.length === 1) {
+              const loaded = restoreState.loadedInstances[0];
+              if (loaded.id !== info.key) throw new Error(`unexpected instance ${loaded.id} is loaded`);
+              if (loaded.config.context_length === priorContext) {
+                restoreNote = " The previous context is still active.";
+              } else {
+                await unloadModelInstance(baseUrl, loaded.id);
+                await loadModelInstance(baseUrl, model.id, priorContext, priorLoadOptions);
+                const restored = await readNativeModelInfo(baseUrl, model.id);
+                if (restored.loadedInstances.length !== 1 || restored.loadedInstances[0].id !== info.key ||
+                    restored.loadedInstances[0].config.context_length !== priorContext) {
+                  throw new Error("LM Studio did not confirm the previous context after reload");
+                }
+                restoreNote = " The previous context was restored.";
+              }
+            } else {
+              await loadModelInstance(baseUrl, model.id, priorContext, priorLoadOptions);
+              const restored = await readNativeModelInfo(baseUrl, model.id);
+              if (restored.loadedInstances.length !== 1 || restored.loadedInstances[0].id !== info.key ||
+                  restored.loadedInstances[0].config.context_length !== priorContext) {
+                throw new Error("LM Studio did not confirm the previous context after reload");
+              }
+              restoreNote = " The previous context was restored.";
+            }
+          } catch (restoreError) {
+            restoreNote = ` WARNING: restoring the previous context also failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}.`;
+          }
+        }
+        return {
+          level: "warning",
+          message: `Could not apply context ${requestedContext} to ${model.id}: ${err instanceof Error ? err.message : String(err)}.${restoreNote}`,
+        };
+      }
+    })();
+
+    runtimeAdjustments.set(operationKey, operation);
+    try {
+      return await operation;
+    } finally {
+      if (runtimeAdjustments.get(operationKey) === operation) runtimeAdjustments.delete(operationKey);
+    }
+  };
 
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.notify(
@@ -494,16 +772,21 @@ export default async function (pi: ExtensionAPI) {
     );
   });
 
-  // ── Prompt to add a profile when a model is explicitly selected ─────────
-  // Fires only on explicit selection from the model list (/model, Ctrl+P).
-  // It does NOT fire at startup, /new, /resume, or /reload — those paths
-  // never emit model_select.
+  // ── Runtime context on selection; profile prompt on explicit selection ───
+  // model_select is awaited by Pi before the selection completes, including
+  // restore events. Runtime capacity is therefore checked before later requests.
+  // The profile-creation prompt remains limited to explicit interactive choices.
 
   pi.on("model_select", async (event, ctx) => {
     const model = event.model;
+    if (!isLmStudioProvider(model.provider)) return;
+
+    const runtimeAdjustment = await ensureProfileRuntimeContext(model);
+    if (runtimeAdjustment && ctx.hasUI) {
+      ctx.ui.notify(runtimeAdjustment.message, runtimeAdjustment.level);
+    }
 
     if (event.source === "restore") return;
-    if (!isLmStudioProvider(model.provider)) return;
     if (promptedModels.has(`${model.provider}:${model.id}`)) return;
     if (!ctx.hasUI) return;
 
@@ -647,9 +930,11 @@ export default async function (pi: ExtensionAPI) {
       return `Profile saved, but ${selectedModel.id} is currently unavailable at its endpoint`;
     }
     const selected = await pi.setModel(updatedModel);
-    return selected
-      ? `Profile saved and applied to ${selectedModel.id}`
-      : `Profile saved, but Pi could not reselect ${selectedModel.id}`;
+    if (!selected) return `Profile saved, but Pi could not reselect ${selectedModel.id}`;
+    const runtimeAdjustment = await ensureProfileRuntimeContext(updatedModel);
+    return runtimeAdjustment
+      ? `Profile saved and applied to ${selectedModel.id}. ${runtimeAdjustment.message}`
+      : `Profile saved and applied to ${selectedModel.id}`;
   };
 
   // ── /sync-models ────────────────────────────────────────────────────────
@@ -879,12 +1164,16 @@ export default async function (pi: ExtensionAPI) {
             ? "LM Studio profile metadata"
             : "LM Studio default metadata"
           : "Pi model registry";
+      const runtimeContextWindow = isLmStudioProvider(model.provider) && endpoints[endpointId]
+        ? await readActiveRuntimeContext(endpointBaseUrl(endpoints[endpointId]), model.id)
+        : undefined;
 
       ctx.ui.setWidget("model-info", buildModelInfoLines(model, {
         full: false,
         metadataSource,
         thinkingLevel: ctx.thinkingLevel,
         endpointName: isLmStudioProvider(model.provider) ? endpoints[endpointId]?.name ?? model.baseUrl : undefined,
+        runtimeContextWindow,
       }));
       infoVisible = true;
     },
@@ -914,11 +1203,15 @@ export default async function (pi: ExtensionAPI) {
             ? "LM Studio profile metadata"
             : "LM Studio default metadata"
           : "Pi model registry";
+      const runtimeContextWindow = isLmStudioProvider(model.provider) && endpoints[endpointId]
+        ? await readActiveRuntimeContext(endpointBaseUrl(endpoints[endpointId]), model.id)
+        : undefined;
       const lines = buildModelInfoLines(model, {
         full: true,
         metadataSource,
         thinkingLevel: ctx.thinkingLevel,
         endpointName: isLmStudioProvider(model.provider) ? endpoints[endpointId]?.name ?? model.baseUrl : undefined,
+        runtimeContextWindow,
       });
 
       await ctx.ui.custom<void>(
