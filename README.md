@@ -64,7 +64,7 @@ Commands:
 - `/model-info` — toggle the current model's brief settings widget
 - `/model-info-full` — show the current model's full settings in a scrollable overlay
 - `/lmstudio-profiles` — edit LM Studio model profiles
-- `/lmstudio-reload` — reload Pi to apply profile changes
+- `/lmstudio-reload` — refresh LM Studio profiles and model catalogs
 
 Profiles are stored in:
 

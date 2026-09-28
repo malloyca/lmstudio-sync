@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
@@ -570,7 +570,8 @@ export default async function (pi: ExtensionAPI) {
     }
 
     await writeFile(PROFILES_PATH, edited);
-    ctx.ui.notify("Profile saved. Run /lmstudio-reload to apply the updated metadata.", "info");
+    const result = await applyProfileChanges(model, ctx.modelRegistry, ctx.signal);
+    ctx.ui.notify(result, "info");
   });
 
   const registerEndpointProvider = (
@@ -617,6 +618,27 @@ export default async function (pi: ExtensionAPI) {
       registerEndpointProvider(endpointId, endpoint, discovery.models);
       return { endpointId, endpoint, discovery };
     }));
+  };
+
+  const applyProfileChanges = async (
+    selectedModel: { provider?: string; id: string } | undefined,
+    registry: ExtensionContext["modelRegistry"],
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    await refreshEndpoints(signal);
+    const provider = selectedModel?.provider;
+    if (!selectedModel || !provider || !isLmStudioProvider(provider)) {
+      return "LM Studio profiles and model catalogs refreshed";
+    }
+
+    const updatedModel = registry.find(provider, selectedModel.id);
+    if (!updatedModel) {
+      return `Profile saved, but ${selectedModel.id} is currently unavailable at its endpoint`;
+    }
+    const selected = await pi.setModel(updatedModel);
+    return selected
+      ? `Profile saved and applied to ${selectedModel.id}`
+      : `Profile saved, but Pi could not reselect ${selectedModel.id}`;
   };
 
   // ── /sync-models ────────────────────────────────────────────────────────
@@ -924,9 +946,10 @@ export default async function (pi: ExtensionAPI) {
   // ── /lmstudio-reload ────────────────────────────────────────────────────
 
   pi.registerCommand("lmstudio-reload", {
-    description: "Reload pi to apply LM Studio profile changes",
+    description: "Refresh LM Studio profiles and model catalogs",
     handler: async (_args, ctx) => {
-      await ctx.reload();
+      const result = await applyProfileChanges(ctx.model, ctx.modelRegistry, ctx.signal);
+      ctx.ui.notify(result, "info");
     },
   });
 }
