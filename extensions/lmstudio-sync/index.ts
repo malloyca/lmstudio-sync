@@ -770,11 +770,17 @@ export default async function (pi: ExtensionAPI) {
       `LM Studio sync: ${Object.keys(endpoints).length} endpoint${Object.keys(endpoints).length === 1 ? "" : "s"} configured`,
       "info",
     );
+    if (ctx.model && isLmStudioProvider(ctx.model.provider)) {
+      const runtimeAdjustment = await ensureProfileRuntimeContext(ctx.model);
+      if (runtimeAdjustment && ctx.hasUI) {
+        ctx.ui.notify(runtimeAdjustment.message, runtimeAdjustment.level);
+      }
+    }
   });
 
   // ── Runtime context on selection; profile prompt on explicit selection ───
-  // model_select is awaited by Pi before the selection completes, including
-  // restore events. Runtime capacity is therefore checked before later requests.
+  // model_select is awaited by Pi before a user/cycle model change completes.
+  // session_start handles models restored or selected at process startup.
   // The profile-creation prompt remains limited to explicit interactive choices.
 
   pi.on("model_select", async (event, ctx) => {
