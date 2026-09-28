@@ -593,17 +593,13 @@ export default async function (pi: ExtensionAPI) {
         supportsDeveloperRole: false,
         supportsReasoningEffort: false,
       },
-      ...(endpoint.enabled === false
-        ? { models: [] }
-        : models
-          ? { models }
-          : {
-              async refreshModels({ signal }: { signal?: AbortSignal }) {
-                const profiles = await loadProfiles();
-                const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
-                return discovery.models;
-              },
-            }),
+      async refreshModels({ signal }: { signal?: AbortSignal }) {
+        if (endpoint.enabled === false) return [];
+        const profiles = await loadProfiles();
+        const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
+        return discovery.models;
+      },
+      ...(models !== undefined ? { models } : endpoint.enabled === false ? { models: [] } : {}),
     };
     pi.registerProvider(endpointProviderId(endpointId), config);
   };
