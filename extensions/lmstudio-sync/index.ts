@@ -30,6 +30,7 @@ const EMBEDDING_PATTERNS = [
 interface LmStudioEndpoint {
   name?: string;
   baseUrl: string;
+  enabled?: boolean;
 }
 
 type EndpointConfig = Record<string, LmStudioEndpoint>;
@@ -190,6 +191,9 @@ async function loadEndpoints(): Promise<EndpointConfig> {
       if (!endpoint || typeof endpoint !== "object" || typeof endpoint.baseUrl !== "string") {
         throw new Error(`endpoint ${id} must define a baseUrl`);
       }
+      if (endpoint.enabled !== undefined && typeof endpoint.enabled !== "boolean") {
+        throw new Error(`endpoint ${id} enabled must be a boolean`);
+      }
     }
     return parsed;
   } catch (err) {
@@ -222,6 +226,7 @@ function isLmStudioProvider(provider?: string): boolean {
 
 interface EndpointDiscovery {
   available: boolean;
+  disabled?: boolean;
   models: ProviderModelConfig[];
   status?: number;
 }
@@ -588,15 +593,17 @@ export default async function (pi: ExtensionAPI) {
         supportsDeveloperRole: false,
         supportsReasoningEffort: false,
       },
-      ...(models
-        ? { models }
-        : {
-            async refreshModels({ signal }: { signal?: AbortSignal }) {
-              const profiles = await loadProfiles();
-              const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
-              return discovery.models;
-            },
-          }),
+      ...(endpoint.enabled === false
+        ? { models: [] }
+        : models
+          ? { models }
+          : {
+              async refreshModels({ signal }: { signal?: AbortSignal }) {
+                const profiles = await loadProfiles();
+                const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
+                return discovery.models;
+              },
+            }),
     };
     pi.registerProvider(endpointProviderId(endpointId), config);
   };
@@ -608,6 +615,14 @@ export default async function (pi: ExtensionAPI) {
   const refreshEndpoints = async (signal?: AbortSignal) => {
     const profiles = await loadProfiles();
     return Promise.all(Object.entries(endpoints).map(async ([endpointId, endpoint]) => {
+      if (endpoint.enabled === false) {
+        registerEndpointProvider(endpointId, endpoint, []);
+        return {
+          endpointId,
+          endpoint,
+          discovery: { available: false, disabled: true, models: [] },
+        };
+      }
       const discovery = await discoverEndpoint(
         endpointBaseUrl(endpoint),
         profiles[endpointId] ?? {},
@@ -653,6 +668,7 @@ export default async function (pi: ExtensionAPI) {
         "",
         ...results.map(({ endpointId, endpoint, discovery }) => {
           const label = endpoint.name ?? endpointId;
+          if (discovery.disabled) return `${label}: disabled`;
           if (!discovery.available) {
             return `${label}: unavailable${discovery.status ? ` (${discovery.status})` : ""}`;
           }
@@ -693,6 +709,7 @@ export default async function (pi: ExtensionAPI) {
         const models = ctx.modelRegistry.getAll();
         const entries: Array<{ label: string; provider: string; offline?: boolean }> = [];
         for (const [endpointId, endpoint] of Object.entries(endpoints)) {
+          if (endpoint.enabled === false) continue;
           const provider = endpointProviderId(endpointId);
           const discovery = endpointStatus.get(provider);
           const name = endpoint.name ?? endpointId;
@@ -767,6 +784,38 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
+  // ── /lmstudio-toggle-endpoint ─────────────────────────────────────────
+
+  pi.registerCommand("lmstudio-toggle-endpoint", {
+    description: "Enable or disable an LM Studio endpoint",
+    handler: async (_args, ctx) => {
+      const choices = Object.entries(endpoints).map(([id, endpoint]) => ({
+        id,
+        endpoint,
+        label: `${endpoint.name ?? id} (${id}) — ${endpoint.enabled === false ? "disabled" : "enabled"}`,
+      }));
+      const choice = await ctx.ui.select(
+        "Choose an endpoint to toggle",
+        choices.map((entry) => entry.label),
+      );
+      if (choice === undefined) return;
+      const selected = choices.find((entry) => entry.label === choice);
+      if (!selected) return;
+
+      const enabled = selected.endpoint.enabled === false;
+      const updatedEndpoints = {
+        ...endpoints,
+        [selected.id]: { ...selected.endpoint, enabled },
+      };
+      await writeFile(ENDPOINTS_PATH, JSON.stringify(updatedEndpoints, null, 2) + "\n");
+      ctx.ui.notify(
+        `${selected.endpoint.name ?? selected.id} ${enabled ? "enabled" : "disabled"} — reloading to apply`,
+        "info",
+      );
+      await ctx.reload();
+    },
+  });
+
   // ── /lmstudio-endpoints ────────────────────────────────────────────────
 
   pi.registerCommand("lmstudio-endpoints", {
@@ -787,6 +836,9 @@ export default async function (pi: ExtensionAPI) {
           if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`invalid endpoint ID: ${id}`);
           if (!endpoint || typeof endpoint !== "object" || typeof (endpoint as { baseUrl?: unknown }).baseUrl !== "string") {
             throw new Error(`endpoint ${id} must define a baseUrl`);
+          }
+          if ((endpoint as { enabled?: unknown }).enabled !== undefined && typeof (endpoint as { enabled?: unknown }).enabled !== "boolean") {
+            throw new Error(`endpoint ${id} enabled must be a boolean`);
           }
         }
         await writeFile(ENDPOINTS_PATH, edited);
