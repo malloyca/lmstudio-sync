@@ -24,7 +24,7 @@ It initially contains the local endpoint:
 }
 ```
 
-Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. Use `/lmstudio-toggle-endpoint` to enable or disable a configured endpoint without editing JSON; disabled endpoints are retained in the config but omitted from discovery and model selection. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
+Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. Use `/lmstudio-toggle-endpoint` to enable or disable a configured endpoint without editing JSON; disabled endpoints are retained in the config but omitted from discovery and model selection. The optional `enabled` property defaults to `true`. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
 
 ## Install
 
@@ -87,11 +87,22 @@ New profiles are scoped by endpoint:
 
 Profiles must be scoped by endpoint. When selecting an LM Studio model without a profile, the extension can prompt you to add one.
 
+### Profile context and LM Studio runtime
+
+A profile's `contextWindow` is used as the minimum context capacity Pi advertises for that model and the requested context when LM Studio loads it. For example, the profile above requests a `131072`-token LM Studio runtime for `m3max/qwen3-8b`.
+
+Runtime capacity follows a **high-water policy** across Pi sessions sharing an endpoint: if the loaded instance already has at least the profile's requested context, it is reused; if not, the extension reloads it at the larger requested size. It never automatically downsizes a loaded instance when a smaller profile is selected. The extension checks LM Studio's reported maximum before loading and warns without changing the runtime if the request is too large. Multiple loaded instances of the same model are left untouched because the native API does not provide reliable instance routing for this adjustment.
+
+Changing a loaded model's context requires unloading and reloading it. This can interrupt requests currently using that shared LM Studio instance, so avoid changing profiles or selecting a larger-context profile while another Pi session is generating with the same model. Separate Pi sessions can use the shared instance sequentially; their conversation histories remain separate.
+
+`contextWindow` is Pi's context/compaction setting, not a strict hard token cap on the conversation. Pi's default compaction settings reserve `16384` tokens and keep `20000` recent tokens; for small model context windows these values can exceed the profile window, so Pi may temporarily retain more conversation context than the profile value. In particular, windows below `20000` are not strictly bounded by the default retention setting. This extension does not modify Pi's compaction settings. For typical profiles of `65536` tokens or more, the default retained history fits within the window, but compaction behavior still depends on Pi's settings and token accounting.
+
 ## Development
 
 ```sh
 npm install
 npm run typecheck
+npm test
 ```
 
 Pi executes the TypeScript extension directly; no build step is required.
