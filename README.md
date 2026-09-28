@@ -59,7 +59,7 @@ The extension registers one provider per configured endpoint and discovers chat 
 Commands:
 
 - `/sync-models` — refresh model lists from all LM Studio endpoints
-- `/set-model-from-provider` — choose a provider, then choose a model from it
+- `/set-model-from-provider` — choose a configured LM Studio endpoint or an authenticated provider, then choose a model
 - `/lmstudio-endpoints` — edit LM Studio endpoint configuration
 - `/model-info` — toggle the current model's brief settings widget
 - `/model-info-full` — show the current model's full settings in a scrollable overlay

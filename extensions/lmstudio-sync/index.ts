@@ -691,6 +691,7 @@ export default async function (pi: ExtensionAPI) {
         }
         for (const [provider, providerModels] of byProvider) {
           if (providerModels.length === 0) continue;
+          if (!ctx.modelRegistry.getProviderAuthStatus(provider).configured) continue;
           const name = ctx.modelRegistry.getProviderDisplayName(provider);
           entries.push({
             label: `${name} — ${providerModels.length} models`,
