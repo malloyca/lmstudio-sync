@@ -570,11 +570,7 @@ export default async function (pi: ExtensionAPI) {
     }
 
     await writeFile(PROFILES_PATH, edited);
-    ctx.ui.notify("Profile saved — reloading to apply", "info");
-
-    // ctx.reload() may only be called from command handlers (it can deadlock
-    // from event handlers), so queue it as a follow-up command instead.
-    pi.sendUserMessage("/lmstudio-reload", { deliverAs: "followUp" });
+    ctx.ui.notify("Profile saved. Run /lmstudio-reload to apply the updated metadata.", "info");
   });
 
   const registerEndpointProvider = (
