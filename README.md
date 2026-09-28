@@ -24,7 +24,7 @@ It initially contains the local endpoint:
 }
 ```
 
-Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
+Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. Use `/lmstudio-toggle-endpoint` to enable or disable a configured endpoint without editing JSON; disabled endpoints are retained in the config but omitted from discovery and model selection. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
 
 ## Install
 
@@ -61,6 +61,7 @@ Commands:
 - `/sync-models` — refresh model lists from all LM Studio endpoints
 - `/set-model-from-provider` — choose a configured LM Studio endpoint or an authenticated provider, then choose a model
 - `/lmstudio-endpoints` — edit LM Studio endpoint configuration
+- `/lmstudio-toggle-endpoint` — enable or disable an endpoint
 - `/model-info` — toggle the current model's brief settings widget
 - `/model-info-full` — show the current model's full settings in a scrollable overlay
 - `/lmstudio-profiles` — edit LM Studio model profiles
