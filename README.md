@@ -1,11 +1,11 @@
 # lmstudio-sync
 
-A [Pi](https://pi.dev) extension that registers one provider per LM Studio endpoint, refreshes model lists, and lets you maintain endpoint-specific profile metadata.
+A [Pi](https://pi.dev) extension that registers providers for LM Studio and oMLX endpoints, refreshes model lists, and lets you maintain LM Studio endpoint-specific profile metadata.
 
 ## Requirements
 
-- Pi with Node.js 24 or newer
-- LM Studio running its local OpenAI-compatible server
+- Pi 1.5 or newer with Node.js 24 or newer
+- LM Studio or oMLX running its local OpenAI-compatible server
 
 On first run, the extension creates an endpoint configuration at:
 
@@ -25,6 +25,43 @@ It initially contains the local endpoint:
 ```
 
 Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. Use `/lmstudio-toggle-endpoint` to enable or disable a configured endpoint without editing JSON; disabled endpoints are retained in the config but omitted from discovery and model selection. The optional `enabled` property defaults to `true`. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
+
+### Local oMLX
+
+On first run, the extension also creates `~/.pi/agent/omlx-endpoints.json`:
+
+```json
+{
+  "local": {
+    "name": "Local oMLX",
+    "baseUrl": "http://localhost:8000/v1"
+  }
+}
+```
+
+This registers **`local/omlx`**, independently of **`local/lmstudio`**. Existing LM Studio configuration is preserved. Both engines appear in `/set-model-from-provider`, including offline endpoints, and both are refreshed by `/sync-models` and Pi's provider model refresh.
+
+Use `/omlx-endpoints` to edit oMLX URLs and `/omlx-toggle-endpoint` to enable or disable them. Disabled endpoints are not queried. The endpoint ID `local` is scoped to its engine, so it can appear in both configuration files.
+
+Discovery uses `/v1/models`, excludes explicit non-chat model types, and retains model aliases and exposed profile IDs returned by oMLX. Pi's model capabilities and token limits currently use this extension's guessed defaults; LM Studio's saved model profiles do not apply to oMLX. Configure oMLX loading, context, and other server-side settings in oMLX itself. The extension never calls LM Studio's native load/unload APIs for an oMLX model.
+
+### oMLX authentication and security
+
+1. Enable API-key authentication in oMLX.
+2. In Pi, run `/login`, select **Local oMLX** (`local/omlx`), and enter the key in Pi's secret-input prompt.
+3. Run `/sync-models` or `/set-model-from-provider` to refresh and select a model.
+
+Each oMLX provider has its own Pi-managed credential. Additional endpoint `office` uses `office/omlx` and requires its own login. `/logout` removes the credential from Pi; revoke or rotate it in oMLX as well if needed. No dummy key or automatic environment-variable fallback is used. Missing credentials, rejected credentials, redirects, and offline servers have distinct status labels.
+
+The extension uses Pi's authentication APIs for discovery and inference and does not read or write `auth.json` itself. Pi stores the key in its agent directory's `auth.json`, alongside non-secret endpoint-binding metadata. This file is **not encrypted**; keep it private, outside repositories, backups/shared folders without appropriate protection, tool-visible mounts, and untrusted process environments.
+
+Keys are bound to the exact configured base URL, including its path. A URL change requires a new `/login`; an old or manually inserted credential without endpoint-binding metadata is not used. oMLX endpoint JSON accepts only `name`, `baseUrl`, and `enabled`, never a raw key or authorization header. URLs containing credentials, query parameters, or fragments are rejected. Use **HTTPS** for non-loopback endpoints, or forward the server through a local encrypted tunnel. Plain HTTP is allowed only for loopback addresses.
+
+Authenticated requests are restricted to the configured model-list and chat-completions URLs, use Bearer headers, and never follow redirects. The extension discards HTTP error bodies and sanitizes transport and terminal inference errors rather than placing raw server errors in Pi sessions. Live catalogs are kept in memory, without credentials or persisted server payloads.
+
+These protections do not isolate credentials from Pi itself, other extensions in its process, a compromised inference server, or tools running with access to Pi's host files/processes. With host Pi plus sandboxed tools, keep `auth.json` unmounted and do not forward credentials into the sandbox. Pi's credential storage is not an OS Keychain.
+
+Pi normally runs on the host, so `localhost` refers to your Mac. For Pi running inside a container, use a local tunnel or a trusted HTTPS endpoint; the HTTP alias `host.docker.internal` is intentionally not treated as loopback.
 
 ## Install
 
@@ -54,12 +91,14 @@ pi -e /absolute/path/to/lmstudio-sync
 
 ## Usage
 
-The extension registers one provider per configured endpoint and discovers chat models from each endpoint's `/v1/models` endpoint. Unavailable endpoints contribute no models until the next refresh.
+The extension registers one provider per configured LM Studio or oMLX endpoint and discovers chat models from each endpoint's `/v1/models` endpoint. Unavailable endpoints contribute no models until the next refresh.
 
 Commands:
 
-- `/sync-models` — refresh model lists from all LM Studio endpoints
-- `/set-model-from-provider` — choose a configured LM Studio endpoint or an authenticated provider, then choose a model
+- `/sync-models` — refresh model lists from all LM Studio and oMLX endpoints
+- `/set-model-from-provider` — choose a configured local-engine endpoint or an authenticated provider, then choose a model
+- `/omlx-endpoints` — edit oMLX endpoint configuration
+- `/omlx-toggle-endpoint` — enable or disable an oMLX endpoint
 - `/lmstudio-endpoints` — edit LM Studio endpoint configuration
 - `/lmstudio-toggle-endpoint` — enable or disable an endpoint
 - `/model-info` — toggle the current model's brief settings widget
@@ -67,7 +106,7 @@ Commands:
 - `/lmstudio-profiles` — edit LM Studio model profiles
 - `/lmstudio-reload` — refresh LM Studio profiles and model catalogs
 
-Profiles are stored in:
+LM Studio model profiles are stored in:
 
 ```text
 ~/.pi/agent/lmstudio-profiles.json
@@ -105,7 +144,15 @@ npm run typecheck
 npm test
 ```
 
-Pi executes the TypeScript extension directly; no build step is required.
+Pi executes the TypeScript extension directly; no build step is required. Configuration follows Pi's agent directory, including `PI_CODING_AGENT_DIR` when set.
+
+To test the development copy on the host without loading the installed copy:
+
+```sh
+pi --no-extensions --no-tools -e /absolute/path/to/lmstudio-sync
+```
+
+The `--no-tools` flag is intentional: disabling other extensions also disables any sandbox integration they provide. Keep model-callable tools off for this host-side smoke test. This does not install the checkout or change which package is configured globally. It still uses your usual Pi credentials and endpoint files. For fully isolated testing, create a private directory outside the project and set `PI_CODING_AGENT_DIR` to it for this invocation; log in separately and remove that directory when finished. Never place test credentials under the sandbox-mounted workspace.
 
 ## License
 

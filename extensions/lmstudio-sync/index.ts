@@ -1,20 +1,26 @@
-import type { ExtensionAPI, ExtensionContext, ProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProviderModelConfig as AnyProviderModelConfig, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { homedir } from "node:os";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
-import { endpointBaseUrl, endpointIdFromProvider, endpointProviderId, validateEndpointConfig } from "./config.ts";
-import type { EndpointConfig, LmStudioEndpoint } from "./config.ts";
+import { endpointBaseUrl, endpointIdFromProvider, endpointProviderId, validateEndpointConfig, DEFAULT_OMLX_ENDPOINTS } from "./config.ts";
+import type { EndpointConfig, InferenceEndpoint, InferenceEngine } from "./config.ts";
+import { loadEndpointConfig } from "./endpoint-store.ts";
+import { createOmlxProvider } from "./omlx-provider.ts";
+import { validateOmlxEndpointConfig } from "./omlx-security.ts";
 import { ensureRuntimeContext, readActiveRuntimeContext } from "./runtime.ts";
-import { buildModel, discoverEndpoint, guessedModelProfile, validateProfileConfig } from "./catalog.ts";
+import { buildModel, discoverEndpoint, discoveryFailureLabel, guessedModelProfile, validateProfileConfig } from "./catalog.ts";
 import type { ModelProfile } from "./catalog.ts";
+
+type ProviderModelConfig = Extract<AnyProviderModelConfig, { type?: "chat" }>;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-const CONFIG_DIR = join(homedir(), ".pi", "agent");
+const CONFIG_DIR = getAgentDir();
 const PROFILES_PATH = join(CONFIG_DIR, "lmstudio-profiles.json");
 const ENDPOINTS_PATH = join(CONFIG_DIR, "lmstudio-endpoints.json");
+const OMLX_ENDPOINTS_PATH = join(CONFIG_DIR, "omlx-endpoints.json");
 const DEFAULT_LOCAL_ENDPOINT_ID = "local";
 const DEFAULT_LOCAL_PORT = "1234";
 
@@ -98,23 +104,13 @@ async function loadProfiles(): Promise<EndpointProfiles> {
 }
 
 async function loadEndpoints(): Promise<EndpointConfig> {
-  try {
-    const raw = await readFile(ENDPOINTS_PATH, "utf8");
-    return validateEndpointConfig(JSON.parse(raw) as unknown);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    // Create the default configuration below when the file is missing.
-  }
-
   const port = process.env.LM_STUDIO_PORT ?? DEFAULT_LOCAL_PORT;
-  const endpoints: EndpointConfig = {
+  return loadEndpointConfig(ENDPOINTS_PATH, {
     [DEFAULT_LOCAL_ENDPOINT_ID]: {
       name: "Local LM Studio",
       baseUrl: `http://localhost:${port}/v1`,
     },
-  };
-  await writeFile(ENDPOINTS_PATH, JSON.stringify(endpoints, null, 2) + "\n");
-  return endpoints;
+  });
 }
 
 function isLmStudioProvider(provider?: string): boolean {
@@ -293,7 +289,7 @@ class SyncResultOverlay implements Component {
       return truncated + " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
     };
 
-    const title = truncateToWidth(" LM Studio Sync ", innerWidth, "...", true);
+    const title = truncateToWidth(" Local Model Sync ", innerWidth, "...", true);
     const titlePad = Math.max(0, innerWidth - visibleWidth(title));
     const result: string[] = [border("╭") + th.fg("accent", title) + border(`${"─".repeat(titlePad)}╮`)];
     for (const line of this.lines.slice(1)) {
@@ -312,6 +308,21 @@ export default async function (pi: ExtensionAPI) {
   // Remove the pre-multi-endpoint registration and its persisted catalog.
   pi.unregisterProvider("lmstudio");
   const endpoints = await loadEndpoints();
+  const omlxEndpoints = await loadEndpointConfig(OMLX_ENDPOINTS_PATH, DEFAULT_OMLX_ENDPOINTS, validateOmlxEndpointConfig);
+  const endpointGroups: Array<{
+    engine: InferenceEngine;
+    name: string;
+    path: string;
+    endpoints: EndpointConfig;
+  }> = [
+    { engine: "lmstudio", name: "LM Studio", path: ENDPOINTS_PATH, endpoints },
+    { engine: "omlx", name: "oMLX", path: OMLX_ENDPOINTS_PATH, endpoints: omlxEndpoints },
+  ];
+  const configuredEndpoints = endpointGroups.flatMap(({ engine, endpoints }) =>
+    Object.entries(endpoints).map(([endpointId, endpoint]) => ({
+      engine, endpointId, endpoint, provider: endpointProviderId(endpointId, engine),
+    }))
+  );
   let infoVisible = false;
 
   // Models we already prompted about this session (add or skip).
@@ -353,7 +364,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.notify(
-      `LM Studio sync: ${Object.keys(endpoints).length} endpoint${Object.keys(endpoints).length === 1 ? "" : "s"} configured`,
+      `Local model sync: ${configuredEndpoints.length} endpoint${configuredEndpoints.length === 1 ? "" : "s"} configured`,
       "info",
     );
     if (ctx.model && isLmStudioProvider(ctx.model.provider)) {
@@ -454,11 +465,12 @@ export default async function (pi: ExtensionAPI) {
 
   const registerEndpointProvider = (
     endpointId: string,
-    endpoint: LmStudioEndpoint,
+    endpoint: InferenceEndpoint,
     models?: ProviderModelConfig[],
   ) => {
     const baseUrl = endpointBaseUrl(endpoint);
     const config = {
+      name: endpoint.name ?? endpointProviderId(endpointId),
       baseUrl,
       apiKey: "lmstudio",
       api: "openai-completions" as const,
@@ -466,8 +478,8 @@ export default async function (pi: ExtensionAPI) {
         supportsDeveloperRole: false,
         supportsReasoningEffort: false,
       },
-      async refreshModels({ signal }: { signal?: AbortSignal }) {
-        if (endpoint.enabled === false) return [];
+      async refreshModels({ signal, allowNetwork }: { signal?: AbortSignal; allowNetwork?: boolean }) {
+        if (endpoint.enabled === false || allowNetwork === false) return [];
         const profiles = await loadProfiles();
         const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
         return discovery.models;
@@ -477,18 +489,31 @@ export default async function (pi: ExtensionAPI) {
     pi.registerProvider(endpointProviderId(endpointId), config);
   };
 
-  for (const [endpointId, endpoint] of Object.entries(endpoints)) {
-    registerEndpointProvider(endpointId, endpoint);
+  const omlxProviders = new Map<string, ReturnType<typeof createOmlxProvider>>();
+  for (const { endpointId, endpoint, engine, provider } of configuredEndpoints) {
+    if (engine === "omlx") {
+      const controller = createOmlxProvider(endpointId, endpoint);
+      omlxProviders.set(provider, controller);
+      pi.registerProvider(controller.provider);
+    } else {
+      registerEndpointProvider(endpointId, endpoint);
+    }
   }
 
-  const refreshEndpoints = async (signal?: AbortSignal) => {
+  const refreshEndpoints = async (registry: ExtensionContext["modelRegistry"], signal?: AbortSignal) => {
     const profiles = await loadProfiles();
-    return Promise.all(Object.entries(endpoints).map(async ([endpointId, endpoint]) => {
+    return Promise.all(configuredEndpoints.map(async ({ endpointId, endpoint, engine, provider }) => {
+      if (engine === "omlx") {
+        const discovery = await omlxProviders.get(provider)!.refresh(registry, signal);
+        return { endpointId, endpoint, engine, provider, discovery };
+      }
       if (endpoint.enabled === false) {
         registerEndpointProvider(endpointId, endpoint, []);
         return {
           endpointId,
           endpoint,
+          engine,
+          provider,
           discovery: { available: false, disabled: true, models: [] },
         };
       }
@@ -500,7 +525,7 @@ export default async function (pi: ExtensionAPI) {
       // Re-registration with an explicit model catalog immediately updates
       // Pi's model registry for selection by this command and future commands.
       registerEndpointProvider(endpointId, endpoint, discovery.models);
-      return { endpointId, endpoint, discovery };
+      return { endpointId, endpoint, engine, provider, discovery };
     }));
   };
 
@@ -509,7 +534,7 @@ export default async function (pi: ExtensionAPI) {
     registry: ExtensionContext["modelRegistry"],
     signal?: AbortSignal,
   ): Promise<string> => {
-    await refreshEndpoints(signal);
+    await refreshEndpoints(registry, signal);
     const provider = selectedModel?.provider;
     if (!selectedModel || !provider || !isLmStudioProvider(provider)) {
       return "LM Studio profiles and model catalogs refreshed";
@@ -530,20 +555,20 @@ export default async function (pi: ExtensionAPI) {
   // ── /sync-models ────────────────────────────────────────────────────────
 
   pi.registerCommand("sync-models", {
-    description: "Refresh model lists from all LM Studio endpoints",
+    description: "Refresh model lists from all LM Studio and oMLX endpoints",
     handler: async (_args, ctx) => {
-      const results = await refreshEndpoints(ctx.signal);
+      const results = await refreshEndpoints(ctx.modelRegistry, ctx.signal);
       const profiles = await loadProfiles();
       const lines = [
-        "LM Studio Sync Results",
+        "Local Model Sync Results",
         "",
-        ...results.map(({ endpointId, endpoint, discovery }) => {
+        ...results.map(({ endpointId, endpoint, engine, discovery }) => {
           const label = endpoint.name ?? endpointId;
           if (discovery.disabled) return `${label}: disabled`;
           if (!discovery.available) {
-            return `${label}: unavailable${discovery.status ? ` (${discovery.status})` : ""}`;
+            return `${label}: ${discoveryFailureLabel(discovery)}`;
           }
-          const endpointProfiles = profiles[endpointId] ?? {};
+          const endpointProfiles = engine === "lmstudio" ? profiles[endpointId] ?? {} : {};
           const profiled = discovery.models.filter((model) =>
             buildModel(model.id, endpointProfiles).source === "profile"
           ).length;
@@ -570,24 +595,23 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("set-model-from-provider", {
     description: "Choose a model by provider",
     handler: async (_args, ctx) => {
-      const endpointResults = await refreshEndpoints(ctx.signal);
-      const endpointIds = new Set(Object.keys(endpoints).map(endpointProviderId));
-      const endpointStatus = new Map(endpointResults.map(({ endpointId, discovery }) => [
-        endpointProviderId(endpointId), discovery,
+      const endpointResults = await refreshEndpoints(ctx.modelRegistry, ctx.signal);
+      const endpointIds = new Set(configuredEndpoints.map(({ provider }) => provider));
+      const endpointStatus = new Map(endpointResults.map(({ provider, discovery }) => [
+        provider, discovery,
       ]));
 
       while (true) {
         const models = ctx.modelRegistry.getAll();
         const entries: Array<{ label: string; provider: string; offline?: boolean }> = [];
-        for (const [endpointId, endpoint] of Object.entries(endpoints)) {
+        for (const { endpointId, endpoint, provider } of configuredEndpoints) {
           if (endpoint.enabled === false) continue;
-          const provider = endpointProviderId(endpointId);
           const discovery = endpointStatus.get(provider);
           const name = endpoint.name ?? endpointId;
           entries.push({
             label: discovery?.available
               ? `${name} — ${discovery.models.length} models`
-              : `${name} — offline`,
+              : `${name} — ${discoveryFailureLabel(discovery ?? { available: false, models: [] })}`,
             provider,
             offline: !discovery?.available,
           });
@@ -655,71 +679,65 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /lmstudio-toggle-endpoint ─────────────────────────────────────────
+  // Keep endpoint configuration separate for each engine. Existing LM Studio
+  // commands and files retain their names and behavior.
+  for (const group of endpointGroups) {
+    pi.registerCommand(`${group.engine}-toggle-endpoint`, {
+      description: `Enable or disable a ${group.name} endpoint`,
+      handler: async (_args, ctx) => {
+        const choices = Object.entries(group.endpoints).map(([id, endpoint]) => ({
+          id,
+          endpoint,
+          label: `${endpoint.name ?? id} (${id}) — ${endpoint.enabled === false ? "disabled" : "enabled"}`,
+        }));
+        const choice = await ctx.ui.select(
+          "Choose an endpoint to toggle",
+          choices.map((entry) => entry.label),
+        );
+        if (choice === undefined) return;
+        const selected = choices.find((entry) => entry.label === choice);
+        if (!selected) return;
 
-  pi.registerCommand("lmstudio-toggle-endpoint", {
-    description: "Enable or disable an LM Studio endpoint",
-    handler: async (_args, ctx) => {
-      const choices = Object.entries(endpoints).map(([id, endpoint]) => ({
-        id,
-        endpoint,
-        label: `${endpoint.name ?? id} (${id}) — ${endpoint.enabled === false ? "disabled" : "enabled"}`,
-      }));
-      const choice = await ctx.ui.select(
-        "Choose an endpoint to toggle",
-        choices.map((entry) => entry.label),
-      );
-      if (choice === undefined) return;
-      const selected = choices.find((entry) => entry.label === choice);
-      if (!selected) return;
+        const enabled = selected.endpoint.enabled === false;
+        const updatedEndpoints = {
+          ...group.endpoints,
+          [selected.id]: { ...selected.endpoint, enabled },
+        };
+        await writeFile(group.path, JSON.stringify(updatedEndpoints, null, 2) + "\n");
+        ctx.ui.notify(
+          `${selected.endpoint.name ?? selected.id} ${enabled ? "enabled" : "disabled"} — reloading to apply`,
+          "info",
+        );
+        await ctx.reload();
+      },
+    });
 
-      const enabled = selected.endpoint.enabled === false;
-      const updatedEndpoints = {
-        ...endpoints,
-        [selected.id]: { ...selected.endpoint, enabled },
-      };
-      await writeFile(ENDPOINTS_PATH, JSON.stringify(updatedEndpoints, null, 2) + "\n");
-      ctx.ui.notify(
-        `${selected.endpoint.name ?? selected.id} ${enabled ? "enabled" : "disabled"} — reloading to apply`,
-        "info",
-      );
-      await ctx.reload();
-    },
-  });
-
-  // ── /lmstudio-endpoints ────────────────────────────────────────────────
-
-  pi.registerCommand("lmstudio-endpoints", {
-    description: "Open LM Studio endpoints for editing",
-    handler: async (_args, ctx) => {
-      const edited = await ctx.ui.editor(
-        `Edit endpoints (${ENDPOINTS_PATH})`,
-        JSON.stringify(endpoints, null, 2) + "\n",
-      );
-      if (edited === undefined) return;
-
-      try {
-        const parsed = JSON.parse(edited);
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).length === 0) {
-          throw new Error("expected a non-empty object of endpoint definitions");
-        }
-        for (const [id, endpoint] of Object.entries(parsed)) {
-          if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`invalid endpoint ID: ${id}`);
-          if (!endpoint || typeof endpoint !== "object" || typeof (endpoint as { baseUrl?: unknown }).baseUrl !== "string") {
-            throw new Error(`endpoint ${id} must define a baseUrl`);
+    pi.registerCommand(`${group.engine}-endpoints`, {
+      description: `Open ${group.name} endpoints for editing`,
+      handler: async (_args, ctx) => {
+        const edited = await ctx.ui.editor(
+          `Edit endpoints (${group.path})`,
+          JSON.stringify(group.endpoints, null, 2) + "\n",
+        );
+        if (edited === undefined) return;
+        try {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(edited);
+          } catch {
+            throw new Error("Endpoint configuration must be valid JSON");
           }
-          if ((endpoint as { enabled?: unknown }).enabled !== undefined && typeof (endpoint as { enabled?: unknown }).enabled !== "boolean") {
-            throw new Error(`endpoint ${id} enabled must be a boolean`);
-          }
+          (group.engine === "omlx" ? validateOmlxEndpointConfig : validateEndpointConfig)(parsed);
+        } catch (err) {
+          ctx.ui.notify(`Invalid endpoint configuration: ${err instanceof Error ? err.message : String(err)}`, "error");
+          return;
         }
-        await writeFile(ENDPOINTS_PATH, edited);
+        await writeFile(group.path, edited);
         ctx.ui.notify("Endpoints saved — reloading to apply", "info");
         await ctx.reload();
-      } catch (err) {
-        ctx.ui.notify(`Invalid endpoint configuration: ${err instanceof Error ? err.message : String(err)}`, "error");
-      }
-    },
-  });
+      },
+    });
+  }
 
   // ── /model-info ────────────────────────────────────────────────────────
 

@@ -1,4 +1,6 @@
-import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ProviderModelConfig as AnyProviderModelConfig } from "@earendil-works/pi-coding-agent";
+
+type ProviderModelConfig = Extract<AnyProviderModelConfig, { type?: "chat" }>;
 
 export interface ModelProfile {
   name?: string;
@@ -21,6 +23,19 @@ export interface EndpointDiscovery {
   disabled?: boolean;
   models: ProviderModelConfig[];
   status?: number;
+  reason?: "auth_required" | "auth_rejected" | "auth_unavailable" | "endpoint_changed" | "redirect_refused";
+}
+
+/** Fixed labels only: never display server bodies or credential resolution errors. */
+export function discoveryFailureLabel(discovery: EndpointDiscovery): string {
+  switch (discovery.reason) {
+    case "auth_required": return "authentication required — use /login";
+    case "auth_rejected": return "authentication rejected — use /login";
+    case "auth_unavailable": return "credentials unavailable — use /login";
+    case "endpoint_changed": return "endpoint changed — sign in again using /login";
+    case "redirect_refused": return "redirect refused — check endpoint URL";
+    default: return discovery.status ? `unavailable (HTTP ${discovery.status})` : "offline";
+  }
 }
 
 const ENDPOINT_TIMEOUT_MS = 5_000;
@@ -147,15 +162,20 @@ export async function discoverEndpoint(
   profiles: Record<string, ModelProfile>,
   signal?: AbortSignal,
   fetcher: typeof fetch = fetch,
+  headers?: Record<string, string>,
 ): Promise<EndpointDiscovery> {
   const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
   const requestSignal = AbortSignal.any(signal ? [signal, timeout] : [timeout]);
   try {
-    const response = await fetcher(`${baseUrl}/models`, { signal: requestSignal });
+    const response = await fetcher(`${baseUrl}/models`, { signal: requestSignal, headers, redirect: "manual" });
     if (!response.ok) return { available: false, models: [], status: response.status };
-    const payload = await response.json() as { data?: Array<{ id?: string }> };
+    // oMLX includes non-chat models (and user-defined aliases) in this list.
+    // Use its explicit type when available, with the legacy ID heuristic below
+    // for servers that return only the standard OpenAI model fields.
+    const payload = await response.json() as { data?: Array<{ id?: string; model_type?: string | null }> };
     if (!Array.isArray(payload.data)) return { available: false, models: [] };
     const models = payload.data
+      .filter((model) => model && (!model.model_type || ["llm", "vlm"].includes(model.model_type)))
       .filter((model): model is { id: string } => typeof model.id === "string")
       .filter((model) => !isEmbeddingModel(model.id))
       .map((model) => buildModel(model.id, profiles).model);

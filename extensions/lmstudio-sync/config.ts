@@ -1,10 +1,20 @@
-export interface LmStudioEndpoint {
+export type InferenceEngine = "lmstudio" | "omlx";
+
+export interface InferenceEndpoint {
   name?: string;
   baseUrl: string;
   enabled?: boolean;
 }
 
-export type EndpointConfig = Record<string, LmStudioEndpoint>;
+export type LmStudioEndpoint = InferenceEndpoint;
+export type EndpointConfig = Record<string, InferenceEndpoint>;
+
+export const DEFAULT_OMLX_ENDPOINTS: EndpointConfig = {
+  local: {
+    name: "Local oMLX",
+    baseUrl: "http://localhost:8000/v1",
+  },
+};
 
 export function validateEndpointConfig(value: unknown): EndpointConfig {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length === 0) {
@@ -25,11 +35,11 @@ export function validateEndpointConfig(value: unknown): EndpointConfig {
   return value as EndpointConfig;
 }
 
-export function endpointProviderId(endpointId: string): string {
-  return `${endpointId}/lmstudio`;
+export function endpointProviderId(endpointId: string, engine: InferenceEngine = "lmstudio"): string {
+  return `${endpointId}/${engine}`;
 }
 
-export function endpointBaseUrl(endpoint: LmStudioEndpoint): string {
+export function endpointBaseUrl(endpoint: InferenceEndpoint): string {
   return endpoint.baseUrl.replace(/\/$/, "");
 }
 

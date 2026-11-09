@@ -89,3 +89,23 @@ test("discovery reports offline, HTTP-error, and malformed responses as unavaila
   assert.deepEqual(malformed, { available: false, models: [] });
 });
 
+test("oMLX discovery keeps chat aliases and excludes explicit non-chat model types", async () => {
+  const result = await discoverEndpoint("http://localhost:8000/v1", {}, undefined, async (input) => {
+    assert.equal(String(input), "http://localhost:8000/v1/models");
+    return Response.json({ data: [
+      { id: "qwen3-8b", model_type: "llm" },
+      { id: "qwen3-8b:thinking", model_type: "llm" },
+      { id: "vision", model_type: "vlm" },
+      { id: "custom-vector-alias", model_type: "embedding" },
+      { id: "custom-ranking-alias", model_type: "reranker" },
+      { id: "document-converter", model_type: "markitdown" },
+      { id: "older-server-model" },
+      { id: "another-older-model", model_type: null },
+      null,
+    ] });
+  });
+  assert.equal(result.available, true);
+  assert.deepEqual(result.models.map((model) => model.id), [
+    "qwen3-8b", "qwen3-8b:thinking", "vision", "older-server-model", "another-older-model",
+  ]);
+});
