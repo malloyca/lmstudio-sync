@@ -162,21 +162,27 @@ export async function discoverEndpoint(
   profiles: Record<string, ModelProfile>,
   signal?: AbortSignal,
   fetcher: typeof fetch = fetch,
-  headers?: Record<string, string>,
+  options: { headers?: Record<string, string>; modelTypes?: readonly string[] } = {},
 ): Promise<EndpointDiscovery> {
   const timeout = AbortSignal.timeout(ENDPOINT_TIMEOUT_MS);
   const requestSignal = AbortSignal.any(signal ? [signal, timeout] : [timeout]);
   try {
-    const response = await fetcher(`${baseUrl}/models`, { signal: requestSignal, headers, redirect: "manual" });
+    const response = await fetcher(`${baseUrl}/models`, {
+      signal: requestSignal,
+      ...(options.headers ? { headers: options.headers } : {}),
+    });
     if (!response.ok) return { available: false, models: [], status: response.status };
-    // oMLX includes non-chat models (and user-defined aliases) in this list.
-    // Use its explicit type when available, with the legacy ID heuristic below
-    // for servers that return only the standard OpenAI model fields.
+    // Only callers that know the server's metadata schema should opt into a
+    // type allowlist. LM Studio keeps its original OpenAI model-ID discovery;
+    // oMLX's type names must not suppress valid models on another engine.
     const payload = await response.json() as { data?: Array<{ id?: string; model_type?: string | null }> };
     if (!Array.isArray(payload.data)) return { available: false, models: [] };
     const models = payload.data
-      .filter((model) => model && (!model.model_type || ["llm", "vlm"].includes(model.model_type)))
+      .filter((model) => model && (!options.modelTypes || !model.model_type || options.modelTypes.includes(model.model_type)))
       .filter((model): model is { id: string } => typeof model.id === "string")
+      // Draft checkpoints cannot serve standalone chat requests, regardless of
+      // which engine advertises them. This explicit naming rule is shared.
+      .filter((model) => !model.id.toLowerCase().includes("dflash2"))
       .filter((model) => !isEmbeddingModel(model.id))
       .map((model) => buildModel(model.id, profiles).model);
     return { available: true, models };

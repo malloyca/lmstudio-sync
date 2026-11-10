@@ -1,6 +1,6 @@
 {
   "name": "lmstudio-sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that syncs LM Studio models and profile metadata",
   "type": "module",
   "license": "MIT",

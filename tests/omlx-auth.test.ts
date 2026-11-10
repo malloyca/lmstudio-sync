@@ -8,7 +8,11 @@ import { discoveryFailureLabel } from "../extensions/lmstudio-sync/catalog.ts";
 
 const endpoint = { name: "Local oMLX", baseUrl: "http://localhost:8000/v1" };
 const context: Context = { messages: [{ role: "user", content: "Hello", timestamp: 0 }] };
-const catalog = () => Response.json({ data: [{ id: "qwen3-8b", model_type: "llm" }] });
+const catalog = () => Response.json({ data: [
+  { id: "qwen3-8b", model_type: "llm" },
+  { id: "qwen3.6-35b-a3b-dflash2", model_type: "llm" },
+  { id: "incoai/Qwen3.8-27B-DFlash2", model_type: "llm" },
+] });
 const login = async (runtime: ReturnType<typeof createModels>, id = "local/omlx", key = "test-only-local-key") =>
   runtime.login(id, "api_key", {
     prompt: async (prompt) => { assert.equal(prompt.type, "secret"); return key; },
@@ -73,6 +77,7 @@ test("Pi-managed credentials are isolated per provider and used for discovery, c
   await login(runtime);
   const result = await runtime.refresh();
   assert.equal(result.errors.size, 0);
+  assert.deepEqual(runtime.getModels("local/omlx").map((model) => model.id), ["qwen3-8b"]);
   assert.equal(sent.length, 1); // The unsigned remote provider was not probed.
   assert.equal(sent[0].authorization, "Bearer test-only-local-key");
   assert.equal(await runtime.getAuth("remote/omlx"), undefined);
@@ -102,7 +107,8 @@ test("Pi-managed credentials are isolated per provider and used for discovery, c
 
   // A second endpoint gets its own key, not an inherited local credential.
   await login(runtime, "remote/omlx", "test-only-remote-key");
-  await remote.refresh(registry(runtime));
+  const remoteCatalog = await remote.refresh(registry(runtime));
+  assert.deepEqual(remoteCatalog.models.map((model) => model.id), ["qwen3-8b"]);
   assert.deepEqual(sent.at(-1), { url: "https://models.example/v1/models", authorization: "Bearer test-only-remote-key" });
 
   // Rotation takes effect at the next request, without reloading the extension.

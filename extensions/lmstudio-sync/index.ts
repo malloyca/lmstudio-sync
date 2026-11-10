@@ -469,6 +469,10 @@ export default async function (pi: ExtensionAPI) {
     models?: ProviderModelConfig[],
   ) => {
     const baseUrl = endpointBaseUrl(endpoint);
+    // Pi invokes this callback with allowNetwork=false after registration (and
+    // when another provider changes). An empty return replaces the live catalog.
+    // Preserve the most recent models without doing I/O during that phase.
+    let cachedModels = models ?? [];
     const config = {
       name: endpoint.name ?? endpointProviderId(endpointId),
       baseUrl,
@@ -479,10 +483,12 @@ export default async function (pi: ExtensionAPI) {
         supportsReasoningEffort: false,
       },
       async refreshModels({ signal, allowNetwork }: { signal?: AbortSignal; allowNetwork?: boolean }) {
-        if (endpoint.enabled === false || allowNetwork === false) return [];
+        if (endpoint.enabled === false) return [];
+        if (allowNetwork === false) return cachedModels;
         const profiles = await loadProfiles();
         const discovery = await discoverEndpoint(baseUrl, profiles[endpointId] ?? {}, signal);
-        return discovery.models;
+        if (!signal?.aborted) cachedModels = discovery.models;
+        return cachedModels;
       },
       ...(models !== undefined ? { models } : endpoint.enabled === false ? { models: [] } : {}),
     };
@@ -659,7 +665,10 @@ export default async function (pi: ExtensionAPI) {
         const providerModels = ctx.modelRegistry.getAll()
           .filter((model) => model.provider === selected.provider)
           .sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id));
-        if (providerModels.length === 0) continue;
+        if (providerModels.length === 0) {
+          ctx.ui.notify(`No models remain available for ${selected.provider}; run /sync-models and try again.`, "warning");
+          continue;
+        }
 
         const modelLabels = providerModels.map((model) => `${model.name ?? model.id} (${model.id})`);
         const selectedModelLabel = await ctx.ui.select(

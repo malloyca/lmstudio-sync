@@ -103,9 +103,37 @@ test("oMLX discovery keeps chat aliases and excludes explicit non-chat model typ
       { id: "another-older-model", model_type: null },
       null,
     ] });
-  });
+  }, { modelTypes: ["llm", "vlm"] });
   assert.equal(result.available, true);
   assert.deepEqual(result.models.map((model) => model.id), [
     "qwen3-8b", "qwen3-8b:thinking", "vision", "older-server-model", "another-older-model",
   ]);
+});
+
+test("shared discovery excludes DFlash2 draft IDs regardless of engine or case", async () => {
+  const fetcher: typeof fetch = async () => Response.json({ data: [
+    { id: "qwen3.6-35b-a3b-dflash2" },
+    { id: "incoai/Qwen3.8-27B-DFlash2" },
+    { id: "DFLASH2-draft" },
+    { id: "zai-org/glm-4.7-flash" },
+    { id: "qwen/qwen3.8-27b" },
+    { id: "nomic-embed-text" },
+  ] });
+  const result = await discoverEndpoint("http://localhost:1234/v1", {
+    "qwen3.6-35b-a3b-dflash2": { name: "Custom profile cannot make a draft usable" },
+    "qwen/qwen3.8-27b": { name: "My Qwen", contextWindow: 65536 },
+  }, undefined, fetcher);
+  assert.equal(result.available, true);
+  assert.deepEqual(result.models.map((model) => model.id), ["zai-org/glm-4.7-flash", "qwen/qwen3.8-27b"]);
+  assert.equal(result.models[1].name, "My Qwen");
+  assert.equal(result.models[1].contextWindow, 65536);
+
+  const omlx = await discoverEndpoint("http://localhost:8000/v1", {}, undefined, fetcher, { modelTypes: ["llm", "vlm"] });
+  assert.deepEqual(omlx.models.map((model) => model.id), ["zai-org/glm-4.7-flash", "qwen/qwen3.8-27b"]);
+});
+
+test("shared discovery allows an empty catalog when only draft models are present", async () => {
+  const result = await discoverEndpoint("http://localhost:1234/v1", {}, undefined,
+    async () => Response.json({ data: [{ id: "only-dflash2-draft" }] }));
+  assert.deepEqual(result, { available: true, models: [] });
 });

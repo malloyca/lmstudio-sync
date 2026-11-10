@@ -31,7 +31,8 @@ export function createOmlxProvider(endpointId: string, endpoint: InferenceEndpoi
     if (!validOmlxKey(auth?.auth.apiKey)) return { available: false, models: [], reason: "auth_required" };
     if (auth?.auth.baseUrl !== baseUrl) return { available: false, models: [], reason: "endpoint_changed" };
     const result = await discoverEndpoint(baseUrl, {}, signal, omlxFetch(baseUrl, fetcher ?? fetch), {
-      Authorization: `Bearer ${auth.auth.apiKey}`,
+      headers: { Authorization: `Bearer ${auth.auth.apiKey}` },
+      modelTypes: ["llm", "vlm"],
     });
     if (result.status === 401 || result.status === 403) return { ...result, reason: "auth_rejected" };
     if (result.status && result.status >= 300 && result.status < 400) return { ...result, reason: "redirect_refused" };

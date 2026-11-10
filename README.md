@@ -26,6 +26,8 @@ It initially contains the local endpoint:
 
 Edit this file, or use `/lmstudio-endpoints`, to add Tailscale or other LM Studio endpoints. Each endpoint gets a provider name such as `local/lmstudio` or `m3max/lmstudio`. Use `/lmstudio-toggle-endpoint` to enable or disable a configured endpoint without editing JSON; disabled endpoints are retained in the config but omitted from discovery and model selection. The optional `enabled` property defaults to `true`. `LM_STUDIO_PORT` is honored only when creating the initial local configuration.
 
+Shared discovery excludes model IDs containing `dflash2` (case-insensitive) from every endpoint, including LM Studio and oMLX, because these draft checkpoints are not standalone chat models. The exclusion applies to both automatic refreshes and `/sync-models`/`/set-model-from-provider`, so they do not enter this extension's Pi `/model` catalogs either. This is an explicit naming-based exclusion, not general draft-model detection. It does not delete models, remove saved profiles, or prevent an inference engine from using them internally for speculative decoding.
+
 ### Local oMLX
 
 On first run, the extension also creates `~/.pi/agent/omlx-endpoints.json`:
